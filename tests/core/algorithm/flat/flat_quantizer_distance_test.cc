@@ -13,6 +13,7 @@
 // limitations under the License.
 #include <cmath>
 #include <gtest/gtest.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/core/framework/index_factory.h>
 #include "flat/flat_distance_matrix.h"
 #include "quantizer/distance_quantizer.h"
@@ -159,7 +160,8 @@ TEST(FlatQuantizerDistance, RawFp16L2AccumulatesInFp32) {
 namespace {
 template <IndexMeta::DataType Type, typename T>
 void CheckEncodedSearcher(const char *metric_name, IndexMeta::MajorOrder order,
-                          size_t dimension = 17) {
+                          size_t dimension = 17,
+                          const char *backend = "MMapFileReadStorage") {
   SCOPED_TRACE(std::string(metric_name) + " type=" + std::to_string(Type) +
                " order=" + std::to_string(order));
   const bool cosine = std::string(metric_name) == "Cosine";
@@ -202,8 +204,9 @@ void CheckEncodedSearcher(const char *metric_name, IndexMeta::MajorOrder order,
   ASSERT_EQ(0, dumper->create(path));
   ASSERT_EQ(0, IndexBuilder::TrainBuildAndDump(builder, holder, dumper));
   ASSERT_EQ(0, dumper->close());
-  auto storage = IndexFactory::CreateStorage("MMapFileReadStorage");
+  auto storage = IndexFactory::CreateStorage(backend);
   ASSERT_NE(nullptr, storage);
+  ASSERT_EQ(0, storage->init(ailego::Params()));
   ASSERT_EQ(0, storage->open(path, false));
   // Use the legacy row path as the reference: its Cosine implementation does
   // not provide every matrix width needed to load a column-major index.
@@ -249,11 +252,10 @@ void CheckEncodedSearcher(const char *metric_name, IndexMeta::MajorOrder order,
         ASSERT_EQ(expected.size(), result.size());
         for (size_t k = 0; k < result.size(); ++k) {
           EXPECT_EQ(expected[k].key(), result[k].key());
-          // FP16 kernels can use a different accumulation order/precision.
+          // Legacy matrix kernels can use a different reduction order.
           const float tolerance =
-              Type == IndexMeta::DT_FP16
-                  ? 1e-3f * std::max(1.0f, std::abs(expected[k].score()))
-                  : 1e-4f;
+              (Type == IndexMeta::DT_FP16 ? 1e-3f : 1e-6f) *
+              std::max(1.0f, std::abs(expected[k].score()));
           EXPECT_NEAR(expected[k].score(), result[k].score(), tolerance);
           if (j == 0 && dimension != 17) {
             if (count == 1 && single.size() <= k)
@@ -293,5 +295,13 @@ TEST(FlatQuantizerDistance, EncodedFp16SearcherMatchesLegacyAndReopens) {
     for (const auto *metric : {"SquaredEuclidean", "InnerProduct", "Cosine"}) {
       CheckEncodedSearcher<IndexMeta::DT_FP16, ailego::Float16>(metric, order);
     }
+  }
+}
+
+TEST(FlatQuantizerDistance, ResidentCentroidPagesPreserveExactScores) {
+  ailego::MemoryLimitPool::get_instance().init(32UL * 1024 * 1024);
+  for (size_t dimension : {32U, 768U}) {
+    CheckEncodedSearcher<IndexMeta::DT_FP32, float>(
+        "SquaredEuclidean", IndexMeta::MO_ROW, dimension, "BufferReadStorage");
   }
 }

@@ -82,6 +82,11 @@ class IndexSegmentStorage : public IndexStorage {
       return region_size_;
     }
 
+    const uint8_t *base_data() const override {
+      const auto *data = parent_->base_data();
+      return data ? data + data_offset_ : nullptr;
+    }
+
     //! Fetch data from segment (with own buffer)
     size_t fetch(size_t offset, void *buf, size_t len) const override {
       return parent_->fetch(data_offset_ + offset, buf, len);
@@ -90,6 +95,10 @@ class IndexSegmentStorage : public IndexStorage {
     //! Read data from segment
     size_t read(size_t offset, MemoryBlock &data, size_t len) override {
       return parent_->read(data_offset_ + offset, data, len);
+    }
+
+    size_t read_scatter(size_t offset, ScatterBlock &data, size_t len) override {
+      return parent_->read_scatter(data_offset_ + offset, data, len);
     }
 
     //! Read data from segment

@@ -24,6 +24,7 @@
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_factory.h>
+#include <zvec/core/framework/index_segment_storage.h>
 #include "utility/utility_params.h"
 
 using namespace zvec;
@@ -406,3 +407,36 @@ TEST_F(BufferReadStorageTest, RangeChecksDoNotOverflow) {
 }
 
 }  // namespace
+
+TEST_F(BufferReadStorageTest, NestedSegmentsPreserveViewsAndScatterLeases) {
+  const size_t length = 2 * ailego::kVectorPageSize;
+  for (const char *name : {"MMapFileReadStorage", "BufferReadStorage"}) {
+    auto storage = IndexFactory::CreateStorage(name);
+    ASSERT_EQ(0, storage->init(ailego::Params()));
+    ASSERT_EQ(0, storage->open(file_path_, false));
+    auto parent = storage->get("payload");
+    ASSERT_NE(nullptr, parent);
+    IndexSegmentStorage::Segment slice(parent, 73, length + 29, 0, 0);
+    if (parent->base_data()) {
+      EXPECT_EQ(static_cast<const uint8_t *>(parent->base_data()) + 73,
+                slice.base_data());
+    }
+    IndexStorage::Segment::ScatterBlock block;
+    ASSERT_EQ(length, slice.read_scatter(19, block, length));
+    if (std::string(name) == "BufferReadStorage") {
+      EXPECT_GT(block.spans.size(), 1U);
+      EXPECT_EQ(nullptr, block.fallback.data());
+      EXPECT_TRUE(block.lease);
+    }
+    const bool scattered = std::string(name) == "BufferReadStorage";
+    if (scattered) ASSERT_EQ(0, storage->close());
+    size_t consumed = 0;
+    for (const auto &span : block.spans) {
+      EXPECT_EQ(0, std::memcmp(span.data, payload_.data() + 92 + consumed,
+                               span.size));
+      consumed += span.size;
+    }
+    EXPECT_EQ(length, consumed);
+    if (!scattered) ASSERT_EQ(0, storage->close());
+  }
+}

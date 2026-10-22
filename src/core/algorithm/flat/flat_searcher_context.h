@@ -14,8 +14,12 @@
 
 #pragma once
 
+#include <limits>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/core/framework/index_document.h>
 #include <zvec/core/framework/index_error.h>
+#include "turbo/quantizer/split_distance_quantizer.h"
+#include "utility/scatter_cursor.h"
 #include "flat_index_format.h"
 #include "flat_searcher.h"
 #include "flat_utility.h"
@@ -490,6 +494,7 @@ class FlatSearcherContext : public IndexSearcher::Context {
   std::shared_ptr<zvec::turbo::Quantizer> quantizer_{};
   std::vector<IndexDocumentHeap> result_heaps_{1};
   std::string batch_queries_{};
+  std::string row_scratch_{};
   float scores_[BATCH_SIZE * BATCH_SIZE];
   bool fetch_vector_{false};
 
@@ -663,30 +668,72 @@ int FlatSearcherContext<BATCH_SIZE>::search_row_nofilter(
   size_t read_offset = 0;
   size_t feature_index = 0;
 
-  while (left_size >= actual_read_size_) {
-    IndexStorage::MemoryBlock data;
-    if (features_segment_->read(read_offset, data, actual_read_size_) !=
-        actual_read_size_) {
-      LOG_ERROR("Failed to read data (%u bytes) from features segment",
-                actual_read_size_);
-      return IndexError_ReadData;
+  const auto *provider =
+      dynamic_cast<const turbo::SplitDistanceQuantizer *>(quantizer_.get());
+  const auto split = provider ? provider->split_distance() : nullptr;
+  auto enqueue = [&](size_t size) -> int {
+    if (split && size > ailego::kVectorPageSize &&
+        feature_size_ <= ailego::kVectorPageSize &&
+        !features_segment_->base_data()) {
+      IndexStorage::Segment::ScatterBlock data;
+      if (features_segment_->read_scatter(read_offset, data, size) != size)
+        return IndexError_ReadData;
+      if (data.spans.size() == 1) {
+        this->enqueue_row_chunk(data.spans[0].data, size, query, qmeta,
+                                &feature_index, heap);
+        read_offset += size;
+        return 0;
+      }
+      ScatterCursor cursor(data);
+      for (size_t rows = size / feature_size_; rows != 0;) {
+        const size_t count = std::min(rows, BATCH_SIZE);
+        auto next = cursor;
+        turbo::SplitVector vectors[BATCH_SIZE];
+        bool valid = true;
+        for (size_t i = 0; i < count; ++i) {
+          const size_t first =
+              std::min<size_t>(feature_size_, next.contiguous_size());
+          vectors[i] = {next.data(), nullptr, first};
+          if (!next.skip(first)) return IndexError_ReadData;
+          const size_t rest = feature_size_ - first;
+          if (next.contiguous_size() < rest) {
+            valid = false;
+            break;
+          }
+          if (rest) vectors[i].second = next.data();
+          if (!next.skip(rest)) return IndexError_ReadData;
+        }
+        if (valid && split(vectors, count, query, quantizer_->dim(), scores_,
+                           std::numeric_limits<float>::infinity())) {
+          if (!cursor.skip(count * feature_size_)) return IndexError_ReadData;
+          for (size_t i = 0; i < count; ++i)
+            heap->emplace(0, scores_[i], feature_index++);
+        } else {
+          row_scratch_.resize(count * feature_size_);
+          if (!cursor.copy(row_scratch_.data(), row_scratch_.size()))
+            return IndexError_ReadData;
+          this->enqueue_row_chunk(row_scratch_.data(), row_scratch_.size(),
+                                  query, qmeta, &feature_index, heap);
+        }
+        rows -= count;
+      }
+    } else {
+      IndexStorage::MemoryBlock data;
+      if (features_segment_->read(read_offset, data, size) != size)
+        return IndexError_ReadData;
+      this->enqueue_row_chunk(data.data(), size, query, qmeta, &feature_index,
+                              heap);
     }
-
-    this->enqueue_row_chunk(data.data(), actual_read_size_, query, qmeta,
-                            &feature_index, heap);
-    read_offset += actual_read_size_;
-    left_size -= actual_read_size_;
+    read_offset += size;
+    return 0;
+  };
+  while (left_size != 0) {
+    const size_t size = std::min<size_t>(left_size, actual_read_size_);
+    const int ret = enqueue(size);
+    if (ret != 0) return ret;
+    left_size -= size;
   }
 
-  IndexStorage::MemoryBlock data;
-  if (features_segment_->read(read_offset, data, left_size) != left_size) {
-    LOG_ERROR("Failed to read data (%zu bytes) from features segment",
-              left_size);
-    return IndexError_ReadData;
-  }
-
-  this->enqueue_row_chunk(data.data(), left_size, query, qmeta, &feature_index,
-                          heap);
   for (auto &it : heap->mutable_container()) {
     it.set_key(owner_->key(it.index()));
   }

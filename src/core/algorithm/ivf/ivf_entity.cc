@@ -19,76 +19,12 @@
 #include <turbo/quantizer/common/pq_quantizer/packed_code_quantizer.h>
 #include <turbo/quantizer/split_distance_quantizer.h>
 #include "metric/metric_params.h"
+#include "utility/scatter_cursor.h"
 #include "ivf_utility.h"
 namespace zvec {
 namespace core {
 
 namespace {
-
-//! Cursor over a scatter read. IVF blocks and vectors are logical byte
-//! ranges, so neither needs to be aligned with an underlying storage page.
-class ScatterCursor {
- public:
-  explicit ScatterCursor(const IndexStorage::Segment::ScatterBlock &block)
-      : spans_(block.spans) {}
-
-  const uint8_t *data() {
-    normalize();
-    return span_index_ < spans_.size() ? spans_[span_index_].data + span_offset_
-                                       : nullptr;
-  }
-
-  size_t contiguous_size() {
-    normalize();
-    return span_index_ < spans_.size() ? spans_[span_index_].size - span_offset_
-                                       : 0;
-  }
-
-  bool skip(size_t size) {
-    while (size != 0) {
-      normalize();
-      if (span_index_ == spans_.size()) {
-        return false;
-      }
-      const size_t available = spans_[span_index_].size - span_offset_;
-      const size_t consumed = std::min(size, available);
-      span_offset_ += consumed;
-      size -= consumed;
-    }
-    return true;
-  }
-
-  bool copy(void *output, size_t size) {
-    auto *dst = static_cast<uint8_t *>(output);
-    while (size != 0) {
-      normalize();
-      if (span_index_ == spans_.size()) {
-        return false;
-      }
-      const auto &span = spans_[span_index_];
-      const size_t available = span.size - span_offset_;
-      const size_t copied = std::min(size, available);
-      std::memcpy(dst, span.data + span_offset_, copied);
-      dst += copied;
-      span_offset_ += copied;
-      size -= copied;
-    }
-    return true;
-  }
-
- private:
-  void normalize() {
-    while (span_index_ < spans_.size() &&
-           span_offset_ == spans_[span_index_].size) {
-      ++span_index_;
-      span_offset_ = 0;
-    }
-  }
-
-  const std::vector<IndexStorage::Segment::ReadSpan> &spans_;
-  size_t span_index_{0};
-  size_t span_offset_{0};
-};
 
 //! Calculate a row-major IVF block directly from its resident page spans.
 //! Only a vector split by a page boundary is copied into scratch.
