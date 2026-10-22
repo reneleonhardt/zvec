@@ -155,11 +155,13 @@ jobs:
           done
           test -f bench-candidate/libvector_alloc_probe.so
           if grep -Eq '/(bench-build|build-candidate)/|not found' results/candidate-libraries.txt; then exit 1; fi
-          nice -n 10 bench-candidate/turbo_avx2_distance_test > results/arithmetic-check.txt 2>&1
-          nice -n 10 bench-candidate/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.CosineDecodePreservesBitsAndExceptionFlags:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization >> results/arithmetic-check.txt 2>&1
+          failed=0
+          nice -n 10 bench-candidate/turbo_avx2_distance_test > results/arithmetic-check.txt 2>&1 || failed=1
+          nice -n 10 bench-candidate/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.CosineDecodePreservesBitsAndExceptionFlags:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization >> results/arithmetic-check.txt 2>&1 || failed=1
           printf 'Frozen source: %s; candidate: %s\n' "$BEFORE_SHA" "$GITHUB_SHA" > results/original-symbol-check.txt
-          nice -n 10 bench-candidate/exact-bits >> results/original-symbol-check.txt 2>&1
+          nice -n 10 bench-candidate/exact-bits >> results/original-symbol-check.txt 2>&1 || failed=1
           ccache --show-stats > results/ccache.txt
+          exit "$failed"
       - uses: actions/cache/save@v6
         if: steps.candidate-reference.outputs.cache-hit != 'true'
         with:
