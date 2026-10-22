@@ -31,7 +31,7 @@ namespace {
 template <typename T>
 void CheckSplits(DataType type, QuantizeType quantize,
                  const std::array<SplitDistanceQuantizer::Distance, 3> &splits,
-                 CpuArchType arch = CpuArchType::kAVX2) {
+                 CpuArchType arch = CpuArchType::kAVX2, size_t count = 9) {
   std::mt19937 generator(7391);
   std::uniform_real_distribution<float> random(-3.1f, 3.1f);
   const auto metrics = {MetricType::kSquaredEuclidean,
@@ -52,8 +52,8 @@ void CheckSplits(DataType type, QuantizeType quantize,
           if (special == 2) {
             const uint64_t qnan = sizeof(T) == 4 ? 0x7fc0002a : 0x7e2a;
             const uint64_t dnan = sizeof(T) == 4 ? 0x7fc00139 : 0x7e39;
-            std::memcpy(query.data(), &qnan, sizeof(T));
-            std::memcpy(rows.data(), &dnan, sizeof(T));
+            std::memcpy(static_cast<void *>(query.data()), &qnan, sizeof(T));
+            std::memcpy(static_cast<void *>(rows.data()), &dnan, sizeof(T));
           }
         }
         size_t metric_index = 0;
@@ -66,25 +66,26 @@ void CheckSplits(DataType type, QuantizeType quantize,
           SCOPED_TRACE(::testing::Message()
                        << "dim=" << dim << " metric=" << metric_index
                        << " special=" << special << " rounding=" << mode
-                       << " quantize=" << static_cast<int>(quantize));
+                       << " quantize=" << static_cast<int>(quantize)
+                       << " count=" << count);
           auto kernels = get_distance_kernels(metric, type, quantize, arch);
           if (!kernels.batch) {
             std::fesetround(rounding);
             GTEST_SKIP();
           }
-          std::array<float, 9> expected, actual, batched;
+          std::array<float, 9> expected{}, actual{}, batched{};
           std::array<const void *, 9> pointers;
-          for (size_t row = 0; row < 9; ++row)
+          for (size_t row = 0; row < count; ++row)
             pointers[row] = rows.data() + row * dim;
-          for (size_t row = 0; row < 9;) {
-            const size_t count =
-                arch == CpuArchType::kAVX512 && row + 1 < 9 ? 2 : 1;
-            kernels.batch(pointers.data() + row, query.data(), count, dim,
+          for (size_t row = 0; row < count;) {
+            const size_t batch =
+                arch == CpuArchType::kAVX512 && row + 1 < count ? 2 : 1;
+            kernels.batch(pointers.data() + row, query.data(), batch, dim,
                           expected.data() + row, nullptr);
-            row += count;
+            row += batch;
           }
-          kernels.batch(pointers.data(), query.data(), 9, dim, batched.data(),
-                        nullptr);
+          kernels.batch(pointers.data(), query.data(), count, dim,
+                        batched.data(), nullptr);
           EXPECT_EQ(0, std::memcmp(expected.data(), batched.data(),
                                    sizeof(expected)));
           const size_t alignment =
@@ -98,7 +99,7 @@ void CheckSplits(DataType type, QuantizeType quantize,
           for (size_t cut : {0UL, 1UL, 7UL, 8UL, dim / 2 + 1, dim - 1, dim}) {
             std::array<SplitVector, 9> vectors;
             std::vector<T> suffix(9 * (dim - cut));
-            for (size_t row = 0; row < 9; ++row) {
+            for (size_t row = 0; row < count; ++row) {
               const T *source = rows.data() + row * dim;
               T *second = suffix.data();
               if (cut != dim) {
@@ -107,27 +108,43 @@ void CheckSplits(DataType type, QuantizeType quantize,
               }
               vectors[row] = {source, second, cut * sizeof(T)};
             }
-            ASSERT_TRUE(splits[metric_index](vectors.data(), 9, query.data(),
-                                             dim, actual.data(), INFINITY));
+            ASSERT_TRUE(splits[metric_index](vectors.data(), count,
+                                             query.data(), dim, actual.data(),
+                                             INFINITY));
             EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
                                      sizeof(expected)))
                 << "dim=" << dim << " cut=" << cut
                 << " metric=" << metric_index;
             if (metric_index == 0) {
               for (float cutoff : {expected[4], .01f}) {
-                ASSERT_TRUE(splits[0](vectors.data(), 9, query.data(), dim,
+                ASSERT_TRUE(splits[0](vectors.data(), count, query.data(), dim,
                                       actual.data(), cutoff));
-                for (size_t row = 0; row < 9; ++row) {
+                for (size_t row = 0; row < count; ++row) {
                   if (!(std::isinf(actual[row]) && expected[row] >= cutoff)) {
                     EXPECT_EQ(0, std::memcmp(&expected[row], &actual[row],
                                              sizeof(float)));
                   }
                 }
-                if (cutoff == .01f && dim > 64 && special < 2)
+                if (cutoff == .01f && dim > 64 && special < 2 && count >= 8) {
                   EXPECT_TRUE(std::isinf(actual[4]));
+                }
               }
             }
           }
+          actual = expected;
+          std::array<SplitVector, 9> invalid;
+          for (size_t row = 0; row < count; ++row)
+            invalid[row] = {pointers[row], nullptr, dim * sizeof(T)};
+          ++invalid[count - 1].first_bytes;
+          EXPECT_FALSE(splits[metric_index](invalid.data(), count, query.data(),
+                                            dim, actual.data(), INFINITY));
+          EXPECT_EQ(
+              0, std::memcmp(expected.data(), actual.data(), sizeof(expected)));
+          --invalid[count - 1].first_bytes;
+          EXPECT_FALSE(splits[metric_index](invalid.data(), count, query.data(),
+                                            dim + 1, actual.data(), INFINITY));
+          EXPECT_EQ(
+              0, std::memcmp(expected.data(), actual.data(), sizeof(expected)));
           ++metric_index;
         }
       }
@@ -138,35 +155,42 @@ void CheckSplits(DataType type, QuantizeType quantize,
 
 TEST(Avx2Distance, SplitAndFourRowBatchesPreserveExistingBatchBits) {
 #if defined(__x86_64__) || defined(_M_X64)
-  CheckSplits<float>(
-      DataType::kFp32, QuantizeType::kFp32,
-      {avx2::squared_euclidean_fp32_split_batch,
-       avx2::inner_product_fp32_split_batch, avx2::cosine_fp32_split_batch});
-  CheckSplits<ailego::Float16>(
-      DataType::kFp16, QuantizeType::kFp16,
-      {avx2::squared_euclidean_fp16_split_batch,
-       avx2::inner_product_fp16_split_batch, avx2::cosine_fp16_split_batch});
+  for (size_t count = 1; count <= 9; ++count) {
+    CheckSplits<float>(
+        DataType::kFp32, QuantizeType::kFp32,
+        {avx2::squared_euclidean_fp32_split_batch,
+         avx2::inner_product_fp32_split_batch, avx2::cosine_fp32_split_batch},
+        CpuArchType::kAVX2, count);
+    CheckSplits<ailego::Float16>(
+        DataType::kFp16, QuantizeType::kFp16,
+        {avx2::squared_euclidean_fp16_split_batch,
+         avx2::inner_product_fp16_split_batch, avx2::cosine_fp16_split_batch},
+        CpuArchType::kAVX2, count);
+  }
 #else
   GTEST_SKIP() << "AVX2 kernels require x86-64";
 #endif
 }
 
 TEST(TurboAvx512Distance, Fp32SplitAndWiderBatchPreserveBits) {
-  CheckSplits<float>(
-      DataType::kFp32, QuantizeType::kFp32,
-      {avx512::squared_euclidean_fp32_split_batch, nullptr, nullptr},
-      CpuArchType::kAVX512);
+  for (size_t count = 1; count <= 9; ++count)
+    CheckSplits<float>(
+        DataType::kFp32, QuantizeType::kFp32,
+        {avx512::squared_euclidean_fp32_split_batch, nullptr, nullptr},
+        CpuArchType::kAVX512, count);
 }
 
 TEST(TurboAvx512Distance, Fp16SplitAndWiderBatchPreserveBits) {
-  CheckSplits<ailego::Float16>(
-      DataType::kFp16, QuantizeType::kFp16,
-      {avx512::squared_euclidean_fp16_split_batch, nullptr, nullptr},
-      CpuArchType::kAVX512);
-  CheckSplits<ailego::Float16>(
-      DataType::kFp16, QuantizeType::kRaw,
-      {avx512::squared_euclidean_raw_fp16_split_batch, nullptr, nullptr},
-      CpuArchType::kAVX512);
+  for (size_t count = 1; count <= 9; ++count) {
+    CheckSplits<ailego::Float16>(
+        DataType::kFp16, QuantizeType::kFp16,
+        {avx512::squared_euclidean_fp16_split_batch, nullptr, nullptr},
+        CpuArchType::kAVX512, count);
+    CheckSplits<ailego::Float16>(
+        DataType::kFp16, QuantizeType::kRaw,
+        {avx512::squared_euclidean_raw_fp16_split_batch, nullptr, nullptr},
+        CpuArchType::kAVX512, count);
+  }
 }
 
 }  // namespace
