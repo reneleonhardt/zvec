@@ -326,22 +326,13 @@ int FlatStreamerEntity::add(uint64_t key, const void *vec, size_t size) {
     return IndexError_Mismatch;
   }
 
-  IndexStorage::MemoryBlock head_block;
-  this->get_head_block(head_block);
+  auto head_segment = get_segment(0);
   BlockLocation block;
-  {
-    const BlockLocation *bl =
-        reinterpret_cast<const BlockLocation *>(head_block.data());
-    if (ailego_unlikely(bl == nullptr)) {
-      LOG_ERROR("Failed to get block loc");
-      return IndexError_ReadData;
-    }
-    block = *bl;
+  if (!head_segment ||
+      head_segment->fetch(0, &block, sizeof(block)) != sizeof(block)) {
+    LOG_ERROR("Failed to get block loc");
+    return IndexError_ReadData;
   }
-  // Release the head block reference early so that the buffer pool ref_count
-  // and memory budget held by it do not block subsequent acquire/evict in this
-  // function (alloc_block / add_to_block may compete for the same memory).
-  head_block.reset(nullptr);
 
   meta_dirty_ = true;
   if (!this->is_valid_block(block)) {
@@ -1722,43 +1713,36 @@ int FlatStreamerEntity::alloc_block(const BlockLocation &next,
 
 int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
                                      const void *data, size_t size) {
-  IndexStorage::MemoryBlock block_header_block;
-  this->get_block_header(block, block_header_block);
-  const BlockHeader *header =
-      reinterpret_cast<const BlockHeader *>(block_header_block.data());
-  if (ailego_unlikely(header == nullptr)) {
+  auto segment = get_segment(block.segment_id);
+  if (!segment) return IndexError_WriteData;
+  BlockHeader header;
+  const size_t hd_off = get_block_header_offset(block.block_index);
+  if (segment->fetch(hd_off, &header, sizeof(header)) != sizeof(header)) {
     LOG_ERROR("Failed to get header");
     return IndexError_ReadData;
   }
 
-  if (header->vector_count == block_vector_count()) {
+  if (header.vector_count == block_vector_count()) {
     return IndexError_IndexFull;
   }
 
-  auto segment = get_segment(block.segment_id);
-  if (!segment) {
-    return IndexError_WriteData;
-  }
-
   size_t vector_off =
-      get_block_vector_offset(block.block_index, header->vector_count);
+      get_block_vector_offset(block.block_index, header.vector_count);
   if (segment->write(vector_off, data, size) != size) {
     LOG_ERROR("Failed to write vector, off=%zu size=%zu", vector_off, size);
     return IndexError_WriteData;
   }
 
   size_t key_off =
-      get_block_key_offset(block.block_index, header->vector_count);
+      get_block_key_offset(block.block_index, header.vector_count);
   if (segment->write(key_off, &key, sizeof(key)) != sizeof(key)) {
     LOG_ERROR("Failed to write key, off=%zu", key_off);
     return IndexError_WriteData;
   }
 
-  BlockHeader hd = *header;
-  hd.vector_count += 1;
-  size_t hd_off = get_block_header_offset(block.block_index);
+  header.vector_count += 1;
   std::unique_lock<KeyMapMutex> map_lock(*key_info_map_lock_);
-  if (segment->write(hd_off, &hd, sizeof(hd)) != sizeof(hd)) {
+  if (segment->write(hd_off, &header, sizeof(header)) != sizeof(header)) {
     LOG_ERROR("Failed to write block header, off=%zu", hd_off);
     return IndexError_WriteData;
   }
@@ -1796,13 +1780,13 @@ int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
 
   meta_dirty_ = true;
   if (id >= vector_count()) {
-    IndexStorage::MemoryBlock head_block;
-    this->get_head_block(head_block);
-    BlockLocation block =
-        *reinterpret_cast<const BlockLocation *>(head_block.data());
-    // Release buffer-pool pin before any alloc_block() call that may trigger
-    // append_segment() and rebuild the pool (same reason as in add()).
-    head_block.reset(nullptr);
+    auto head_segment = get_segment(0);
+    BlockLocation block;
+    if (!head_segment ||
+        head_segment->fetch(0, &block, sizeof(block)) != sizeof(block)) {
+      LOG_ERROR("Failed to get block loc");
+      return IndexError_ReadData;
+    }
     if (!this->is_valid_block(block)) {
       int ret = this->alloc_block(block, &block);
       if (ailego_unlikely(ret != 0)) {
