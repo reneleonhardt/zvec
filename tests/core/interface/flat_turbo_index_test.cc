@@ -355,6 +355,7 @@ TEST(FlatTurboIndex, BufferPoolPreservesSingleRowTailBits) {
         ASSERT_EQ(vectors.size(), expected.doc_list_.size());
         for (int pass = 0; pass < 2; ++pass) {
           SearchResult actual;
+          if (filtered) query->filter->set([](uint64_t) { return false; });
           ASSERT_EQ(0, pooled->search(data, query, &actual));
           ASSERT_EQ(expected.doc_list_.size(), actual.doc_list_.size());
           for (size_t i = 0; i < actual.doc_list_.size(); ++i) {
