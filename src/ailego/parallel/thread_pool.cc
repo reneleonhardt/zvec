@@ -179,15 +179,17 @@ bool ThreadPool::picking(ThreadPool::Task *task) {
   task->handle = std::move(head.handle);
   queue_.pop();
 
-  // Update group control
+  {
+    std::lock_guard<std::mutex> lock(wait_mutex_);
+    ++active_count_;
+    --pending_count_;
+  }
+  latch.unlock();
+
+  // The group remains pending until activation, so waiters cannot finish early.
   if (task->group) {
     task->group->mark_task_actived();
   }
-
-  // Counter of active tasks
-  std::unique_lock<std::mutex> lock(wait_mutex_);
-  ++active_count_;
-  --pending_count_;
 
   return true;
 }

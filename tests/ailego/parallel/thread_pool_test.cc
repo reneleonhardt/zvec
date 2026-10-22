@@ -246,3 +246,23 @@ TEST(ThreadPool, TaskGroup2) {
   }
   pool.wait_finish();
 }
+
+TEST(ThreadPool, GroupWaitIncludesTasksSubmittedByActiveTask) {
+  ThreadPool pool(2, false);
+  auto group = pool.make_group();
+  for (int wave = 0; wave < 32; ++wave) {
+    std::atomic_uint count{0};
+    group->execute([&]() {
+      for (int i = 0; i < 128; ++i) {
+        group->execute([&]() { ++count; });
+      }
+    });
+    group->wait_finish();
+    pool.wait_finish();
+    EXPECT_EQ(128u, count);
+    EXPECT_EQ(0u, group->active_count());
+    EXPECT_EQ(0u, pool.pending_count());
+  }
+  pool.stop();
+  pool.wait_stop();
+}
