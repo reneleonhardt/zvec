@@ -13,12 +13,14 @@
 // limitations under the License.
 
 #include <array>
+#include <cfenv>
 #include <cmath>
 #include <cstring>
 #include <limits>
 #include <random>
 #include <type_traits>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/utility/float_helper.h>
@@ -110,6 +112,50 @@ TEST(NeonDistance, Fp32BatchPreservesScalarBits) {
       }
     }
   }
+}
+
+TEST(NeonDistance, Fp16DotBatchPreservesScalarBits) {
+#if !defined(AILEGO_ARM64_GNU_LIKE)
+  GTEST_SKIP() << "NEON FP16 conversion requires AArch64";
+#else
+  const int rounding = std::fegetround();
+  auto restore = ailego::ScopeGuard::Make([&]() { std::fesetround(rounding); });
+  std::mt19937 generator(6211);
+  std::vector<uint16_t> query(1538);
+  std::vector<std::vector<uint16_t>> rows(9, query);
+  for (auto &value : query) value = generator() % 0x7c00;
+  std::vector<const void *> pointers;
+  for (auto &row : rows) {
+    for (auto &value : row)
+      value = (generator() % 0x7c00) | (generator() & 0x8000);
+    pointers.push_back(row.data() + 1);
+  }
+  for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+    ASSERT_EQ(0, std::fesetround(mode));
+    for (uint16_t special : {0U, 0x8000U, 0x7c00U, 0x7e11U, 0x7c01U}) {
+      rows[0][1] = special;
+      for (size_t dim : {0U, 1U, 3U, 4U, 7U, 8U, 9U, 15U, 16U, 17U, 31U, 32U,
+                         33U, 768U, 769U, 1536U}) {
+        for (size_t count : {0U, 1U, 3U, 4U, 5U, 7U, 8U, 9U}) {
+          std::vector<float> expected(count + 1, 12345.f), actual = expected;
+          for (bool cosine : {false, true}) {
+            auto point = cosine ? neon::cosine_fp16_distance
+                                : neon::inner_product_fp16_distance;
+            auto batch = cosine ? neon::cosine_fp16_batch_distance
+                                : neon::inner_product_fp16_batch_distance;
+            for (size_t i = 0; i < count; ++i)
+              point(pointers[i], query.data() + 1, dim, &expected[i]);
+            batch(pointers.data(), query.data() + 1, count, dim, actual.data(),
+                  nullptr);
+            EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                                     actual.size() * sizeof(float)))
+                << "dim=" << dim << " count=" << count << " half=" << special;
+          }
+        }
+      }
+    }
+  }
+#endif
 }
 
 TEST(NeonDistance, Fp32SplitPreservesScalarBits) {

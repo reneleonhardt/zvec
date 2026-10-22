@@ -62,7 +62,46 @@ void inner_product_fp16_batch_distance(const void *const *vectors,
                                        const void *query, size_t n, size_t dim,
                                        float *distances,
                                        const void *const * /*extra_values*/) {
-  for (size_t i = 0; i < n; ++i) {
+  size_t i = 0;
+#if defined(AILEGO_ARM64_GNU_LIKE)
+  const auto *q = reinterpret_cast<const float16_t *>(query);
+  for (; n - i >= 4; i += 4) {
+    const float16_t *rows[4];
+    float32x4_t sum0[4] = {}, sum1[4] = {};
+    for (size_t row = 0; row < 4; ++row)
+      rows[row] = reinterpret_cast<const float16_t *>(vectors[i + row]);
+    size_t d = 0;
+    // Share query widening while retaining each row's two accumulator chains.
+    for (; d + 8 <= dim; d += 8) {
+      const auto query8 = vld1q_f16(q + d);
+      const auto q0 = vcvt_f32_f16(vget_low_f16(query8));
+      const auto q1 = vcvt_high_f32_f16(query8);
+      for (size_t row = 0; row < 4; ++row) {
+        const auto values = vld1q_f16(rows[row] + d);
+        sum0[row] = vfmaq_f32(sum0[row], vcvt_f32_f16(vget_low_f16(values)), q0);
+        sum1[row] = vfmaq_f32(sum1[row], vcvt_high_f32_f16(values), q1);
+      }
+    }
+    if (d + 4 <= dim) {
+      const auto q0 = vcvt_f32_f16(vld1_f16(q + d));
+      for (size_t row = 0; row < 4; ++row)
+        sum0[row] = vfmaq_f32(
+            sum0[row], vcvt_f32_f16(vld1_f16(rows[row] + d)), q0);
+      d += 4;
+    }
+    float totals[4];
+    for (size_t row = 0; row < 4; ++row)
+      totals[row] = vaddvq_f32(vaddq_f32(sum0[row], sum1[row]));
+    for (; d < dim; ++d) {
+      const float value = static_cast<float>(q[d]);
+      for (size_t row = 0; row < 4; ++row)
+        totals[row] += static_cast<float>(rows[row][d]) * value;
+    }
+    for (size_t row = 0; row < 4; ++row)
+      distances[i + row] = -totals[row];
+  }
+#endif
+  for (; i < n; ++i) {
     inner_product_fp16_distance(vectors[i], query, dim, &distances[i]);
   }
 }
