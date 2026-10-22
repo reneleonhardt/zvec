@@ -63,6 +63,10 @@ void CheckSplits(DataType type, QuantizeType quantize,
             ++metric_index;
             continue;
           }
+          SCOPED_TRACE(::testing::Message()
+                       << "dim=" << dim << " metric=" << metric_index
+                       << " special=" << special << " rounding=" << mode
+                       << " quantize=" << static_cast<int>(quantize));
           auto kernels = get_distance_kernels(metric, type, quantize, arch);
           if (!kernels.batch) {
             std::fesetround(rounding);
