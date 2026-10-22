@@ -85,30 +85,47 @@ TEST(NeonDistance, Fp32MatchesScalarForRemainders) {
 }
 
 TEST(NeonDistance, Fp32BatchPreservesScalarBits) {
+  const int rounding = std::fegetround();
+  auto restore = ailego::ScopeGuard::Make([&]() { std::fesetround(rounding); });
+  const RawDistanceFn points[] = {neon::squared_euclidean_fp32_distance,
+                                  neon::inner_product_fp32_distance,
+                                  neon::cosine_fp32_distance};
+  const decltype(&neon::squared_euclidean_fp32_batch_distance) batches[] = {
+      neon::squared_euclidean_fp32_batch_distance,
+      neon::inner_product_fp32_batch_distance,
+      neon::cosine_fp32_batch_distance};
   std::mt19937 generator(1927);
   std::uniform_real_distribution<float> random(-3.2f, 3.2f);
-  for (float scale : {1.f, 1e10f, 1e-20f}) {
-    std::vector<float> query(770);
-    for (auto &v : query) v = random(generator) * scale;
-    std::vector<std::vector<float>> rows(9, std::vector<float>(770));
-    std::vector<const void *> pointers;
-    for (auto &row : rows) {
-      for (auto &v : row) v = random(generator) * scale;
-      pointers.push_back(row.data() + 1);
-    }
-    rows[0] = query;
-    pointers[0] = rows[0].data() + 1;
-    for (size_t dim : {0U, 1U, 7U, 8U, 9U, 16U, 17U, 31U, 32U, 768U, 769U}) {
-      for (size_t count : {0U, 1U, 3U, 4U, 5U, 7U, 8U, 9U}) {
-        std::vector<float> expected(count + 1, 12345.f), actual = expected;
-        for (size_t i = 0; i < count; ++i)
-          neon::squared_euclidean_fp32_distance(pointers[i], query.data() + 1, dim,
-                                                &expected[i]);
-        neon::squared_euclidean_fp32_batch_distance(
-            pointers.data(), query.data() + 1, count, dim, actual.data(), nullptr);
-        EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
-                                 actual.size() * sizeof(float)))
-            << "dim=" << dim << " count=" << count << " scale=" << scale;
+  for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+    ASSERT_EQ(0, std::fesetround(mode));
+    for (float scale : {1.f, 1e10f, 1e-20f, 1e20f}) {
+      std::vector<float> query(770);
+      for (auto &v : query) v = random(generator) * scale;
+      std::vector<std::vector<float>> rows(9, std::vector<float>(770));
+      std::vector<const void *> pointers;
+      for (auto &row : rows) {
+        for (auto &v : row) v = random(generator) * scale;
+        pointers.push_back(row.data() + 1);
+      }
+      rows[0] = query;
+      pointers[0] = rows[0].data() + 1;
+      rows[1][3] = -0.f;
+      rows[2][2] = std::numeric_limits<float>::infinity();
+      rows[3][1] = std::numeric_limits<float>::quiet_NaN();
+      for (size_t dim : {0U, 1U, 7U, 8U, 9U, 16U, 17U, 31U, 32U, 768U, 769U}) {
+        for (size_t count : {0U, 1U, 3U, 4U, 5U, 7U, 8U, 9U}) {
+          std::vector<float> expected(count + 1, 12345.f), actual = expected;
+          for (size_t metric = 0; metric < 3; ++metric) {
+            for (size_t i = 0; i < count; ++i)
+              points[metric](pointers[i], query.data() + 1, dim, &expected[i]);
+            batches[metric](pointers.data(), query.data() + 1, count, dim,
+                            actual.data(), nullptr);
+            EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                                     actual.size() * sizeof(float)))
+                << "metric=" << metric << " dim=" << dim << " count=" << count
+                << " scale=" << scale;
+          }
+        }
       }
     }
   }

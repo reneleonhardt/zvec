@@ -58,7 +58,40 @@ void inner_product_fp32_batch_distance(const void *const *vectors,
                                        const void *query, size_t n, size_t dim,
                                        float *distances,
                                        const void *const * /*extra_values*/) {
-  for (size_t i = 0; i < n; ++i) {
+  size_t i = 0;
+#if defined(AILEGO_ARM64_NEON)
+  const auto *q = static_cast<const float *>(query);
+  for (; n - i >= 4; i += 4) {
+    const float *rows[4];
+    float32x4_t sum0[4] = {}, sum1[4] = {};
+    for (size_t row = 0; row < 4; ++row)
+      rows[row] = static_cast<const float *>(vectors[i + row]);
+    size_t d = 0;
+    // Interleave rows without changing either accumulator's operation order.
+    for (; d + 8 <= dim; d += 8) {
+      const auto q0 = vld1q_f32(q + d), q1 = vld1q_f32(q + d + 4);
+      for (size_t row = 0; row < 4; ++row) {
+        sum0[row] = vfmaq_f32(sum0[row], vld1q_f32(rows[row] + d), q0);
+        sum1[row] = vfmaq_f32(sum1[row], vld1q_f32(rows[row] + d + 4), q1);
+      }
+    }
+    if (d + 4 <= dim) {
+      const auto q0 = vld1q_f32(q + d);
+      for (size_t row = 0; row < 4; ++row)
+        sum0[row] = vfmaq_f32(sum0[row], vld1q_f32(rows[row] + d), q0);
+      d += 4;
+    }
+    float totals[4];
+    for (size_t row = 0; row < 4; ++row)
+      totals[row] = vaddvq_f32(vaddq_f32(sum0[row], sum1[row]));
+    for (; d < dim; ++d)
+      for (size_t row = 0; row < 4; ++row)
+        totals[row] += rows[row][d] * q[d];
+    for (size_t row = 0; row < 4; ++row)
+      distances[i + row] = -totals[row];
+  }
+#endif
+  for (; i < n; ++i) {
     inner_product_fp32_distance(vectors[i], query, dim, &distances[i]);
   }
 }
