@@ -14,6 +14,7 @@
 
 #include "ivf_index_provider.h"
 #include <algorithm>
+#include <cfenv>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -21,6 +22,7 @@
 #include <string>
 #include <vector>
 #include <gtest/gtest.h>
+#include <turbo/quantizer/fp32_quantizer/fp32_quantizer.h>
 
 using namespace zvec::core;
 
@@ -215,6 +217,84 @@ struct MappingProvider {
 };
 
 }  // namespace
+
+TEST(IVFIndexProviderTest, HalfReconstructionRetainsOutputStorage) {
+  class ReconstructionQuantizer : public zvec::turbo::Fp32Quantizer {
+   public:
+    zvec::turbo::DataType input_data_type() const override {
+      return zvec::turbo::DataType::kFp16;
+    }
+    int dim() const override {
+      return values.size();
+    }
+    int dequantize(const void *, const IndexQueryMeta &,
+                   std::string *out) const override {
+      out->assign(reinterpret_cast<const char *>(values.data()),
+                  values.size() * sizeof(values[0]));
+      return 0;
+    }
+    std::vector<uint32_t> values{0,          0x80000000, 0x3f800000, 0xbf800000,
+                                 0x33800000, 0x33000000, 0x387fc000, 0x38800000,
+                                 0x477fe000, 0x477ff000, 0x47800000, 0x7f800000,
+                                 0xff800000, 0x7fc12345, 0xffc54321, 0x7f812345,
+                                 0x3f801000, 0x3f803000, 1};
+  };
+  MappingProvider fixture(true);
+  ASSERT_EQ(0, fixture.load_status);
+  auto quantizer = std::make_shared<ReconstructionQuantizer>();
+  const_cast<zvec::turbo::Quantizer::Pointer &>(fixture.entity->quantizer()) =
+      quantizer;
+  auto provider = std::static_pointer_cast<IVFIndexProvider>(fixture.provider);
+  std::string output(256, '\0');
+  const auto *storage = output.data();
+  const auto capacity = output.capacity();
+  for (int rounding : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+    std::fenv_t environment;
+    std::fegetenv(&environment);
+    std::fesetround(rounding);
+    std::feclearexcept(FE_ALL_EXCEPT);
+    std::string expected;
+    for (uint32_t bits : quantizer->values) {
+      float value;
+      std::memcpy(&value, &bits, sizeof(value));
+      const zvec::ailego::Float16 half(value);
+      expected.append(reinterpret_cast<const char *>(&half), sizeof(half));
+    }
+    const int expected_flags = std::fetestexcept(FE_ALL_EXCEPT);
+    std::feclearexcept(FE_ALL_EXCEPT);
+    const int result = provider->copy_vector(1, &output);
+    const int actual_flags = std::fetestexcept(FE_ALL_EXCEPT);
+    std::fesetenv(&environment);
+    EXPECT_EQ(0, result);
+    EXPECT_EQ(expected, output);
+    EXPECT_EQ(expected_flags, actual_flags);
+    EXPECT_EQ(storage, output.data());
+    EXPECT_EQ(capacity, output.capacity());
+
+    std::string fresh;
+    std::fesetround(rounding);
+    std::feclearexcept(FE_ALL_EXCEPT);
+    const int fresh_result = provider->copy_vector(1, &fresh);
+    const int fresh_flags = std::fetestexcept(FE_ALL_EXCEPT);
+    std::fesetenv(&environment);
+    EXPECT_EQ(0, fresh_result);
+    EXPECT_EQ(expected, fresh);
+    EXPECT_EQ(expected_flags, fresh_flags);
+    EXPECT_EQ(std::string(expected.size(), '\0').capacity(), fresh.capacity());
+    fresh.clear();
+    std::fesetround(rounding);
+    const int reused_result = provider->copy_vector(1, &fresh);
+    std::fesetenv(&environment);
+    EXPECT_EQ(0, reused_result);
+    EXPECT_EQ(expected, fresh);
+    EXPECT_GE(fresh.capacity(), quantizer->values.size() * sizeof(float));
+  }
+  quantizer->values.resize(8);
+  std::string small;
+  EXPECT_EQ(0, provider->copy_vector(1, &small));
+  EXPECT_EQ(16u, small.size());
+  EXPECT_EQ(std::string(16, '\0').capacity(), small.capacity());
+}
 
 TEST(IVFIndexProviderTest, MappingFetchFailuresAreStickyAndNotNormalEof) {
   for (size_t failed_rank : {size_t{0}, kMappingChunkEntries}) {

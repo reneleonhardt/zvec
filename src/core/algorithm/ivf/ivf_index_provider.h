@@ -161,6 +161,7 @@ class IVFIndexProvider : public IndexProvider {
     qmeta.set_meta(meta.data_type(), meta.dimension(),
                    static_cast<uint32_t>(entity->quantizer()->type()),
                    meta.extra_meta_size());
+    const size_t capacity = buffer->capacity();
     if (entity->quantizer()->dequantize(data, qmeta, buffer) != 0) {
       return nullptr;
     }
@@ -168,14 +169,21 @@ class IVFIndexProvider : public IndexProvider {
     if (entity->quantizer()->input_data_type() == turbo::DataType::kFp16 &&
         buffer->size() == dim * sizeof(float)) {
       // PQ reconstruction is FP32 even when its training input was FP16.
-      std::string half(dim * sizeof(ailego::Float16), '\0');
+      // Keep fresh results compact; reusable buffers can narrow in place.
+      const bool reuse = capacity >= dim * sizeof(ailego::Float16) &&
+                         capacity > std::string{}.capacity();
+      std::string half(reuse ? 0 : dim * sizeof(ailego::Float16), '\0');
+      char *output = reuse ? buffer->data() : half.data();
       for (size_t i = 0; i < dim; ++i) {
         float value;
         std::memcpy(&value, buffer->data() + i * sizeof(float), sizeof(value));
         ailego::Float16 encoded(value);
-        std::memcpy(&half[i * sizeof(encoded)], &encoded, sizeof(encoded));
+        std::memcpy(output + i * sizeof(encoded), &encoded, sizeof(encoded));
       }
-      *buffer = std::move(half);
+      if (reuse)
+        buffer->resize(dim * sizeof(ailego::Float16));
+      else
+        *buffer = std::move(half);
     }
     return buffer->data();
   }
