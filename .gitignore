@@ -1,4 +1,5 @@
-.*
+# Ignore hidden entries without matching the repository root itself.
+.?*
 *~
 bazel-*
 build*
