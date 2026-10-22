@@ -121,9 +121,13 @@ int Fp16Quantizer::dequantize(const void *in, const IndexQueryMeta &qmeta,
   out->resize(byte_size);
   const uint16_t *in_buf = reinterpret_cast<const uint16_t *>(in);
   float *out_buf = reinterpret_cast<float *>(&(*out)[0]);
-  ailego::FloatHelper::ToFP32(in_buf, raw_dim, out_buf);
+  const bool cosine = meta_.metric_name() == "Cosine";
+  // Physical cosine decoding writes every output after rounding back to FP16.
+  if (!cosine || storage_data_type_ != IndexMeta::DT_FP16) {
+    ailego::FloatHelper::ToFP32(in_buf, raw_dim, out_buf);
+  }
 
-  if (meta_.metric_name() == "Cosine") {
+  if (cosine) {
     // Denormalize the vector using the stored norm.
     float norm = 0.0f;
     std::memcpy(

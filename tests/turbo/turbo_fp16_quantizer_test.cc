@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
 #include <cstring>
@@ -23,6 +24,7 @@
 #include <string>
 #include <vector>
 #include <ailego/math/normalizer.h>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <turbo/distance/neon_fp16/fp16/cosine.h>
 #include <turbo/quantizer/quantizer.h>
@@ -292,6 +294,53 @@ TEST(Fp16Quantizer, General) {
         reinterpret_cast<const float *>(dequant_buffer.data());
     for (size_t i = 0; i < holder->dimension(); ++i) {
       EXPECT_NEAR(original_data[i], dequantize_data[i], 1e-2);
+    }
+  }
+}
+
+TEST(Fp16Quantizer, DecodePreservesBitsForEveryHalfEncoding) {
+  const int rounding = std::fegetround();
+  auto restore = ScopeGuard::Make([&]() { std::fesetround(rounding); });
+  constexpr size_t dim = 65536;
+  std::vector<uint16_t> encoded(dim + sizeof(float) / sizeof(uint16_t));
+  for (size_t i = 0; i < dim; ++i) encoded[i] = static_cast<uint16_t>(i);
+  std::vector<float> expected(dim);
+  for (const char *metric : {"Cosine", "SquaredEuclidean"}) {
+    const bool cosine = std::strcmp(metric, "Cosine") == 0;
+    IndexMeta meta;
+    meta.set_meta(IndexMeta::DT_FP32, dim);
+    meta.set_metric(metric, 0, Params());
+    IndexQueryMeta qmeta(IndexMeta::MT_DENSE, IndexMeta::DT_FP16,
+                         sizeof(uint16_t), dim, 0, cosine ? sizeof(float) : 0);
+    for (bool physical : {false, true}) {
+      auto quantizer = IndexFactory::CreateQuantizer("Fp16Quantizer");
+      ASSERT_TRUE(quantizer);
+      Params params;
+      if (physical)
+        params.set(turbo::QUANTIZER_STORAGE_DATA_TYPE,
+                   static_cast<int32_t>(IndexMeta::DT_FP16));
+      ASSERT_EQ(0, quantizer->init(meta, params));
+      for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+        ASSERT_EQ(0, std::fesetround(mode));
+        for (float norm : {0.f, -0.f, 1.f, -1.f, .003f, 2.3f, 1000.f,
+                           std::numeric_limits<float>::infinity(),
+                           std::numeric_limits<float>::quiet_NaN()}) {
+          std::memcpy(encoded.data() + dim, &norm, sizeof(norm));
+          FloatHelper::ToFP32(encoded.data(), dim, expected.data());
+          if (cosine) {
+            for (float &value : expected) {
+              value *= norm;
+              if (physical) value = static_cast<float>(Float16(value));
+            }
+          }
+          std::string decoded;
+          ASSERT_EQ(0, quantizer->dequantize(encoded.data(), qmeta, &decoded));
+          ASSERT_EQ(dim * sizeof(float), decoded.size());
+          EXPECT_EQ(0, std::memcmp(expected.data(), decoded.data(), decoded.size()))
+              << metric << " physical=" << physical << " rounding=" << mode
+              << " norm=" << norm;
+        }
+      }
     }
   }
 }
