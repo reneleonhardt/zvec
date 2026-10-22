@@ -64,7 +64,7 @@ void squared_euclidean_batch_impl(
 
     if (prefetch_ptrs[0]) {
       for (size_t i = 0; i < dp_batch; ++i) {
-        ailego_prefetch(prefetch_ptrs[i] + dim);
+        if (prefetch_ptrs[i]) ailego_prefetch(prefetch_ptrs[i] + dim);
       }
     }
 
@@ -93,7 +93,7 @@ void squared_euclidean_batch_impl(
 // Dispatch batched squared euclidean over all `n` vectors with prefetching.
 void squared_euclidean_batch(const void *const *vectors, const void *query,
                              size_t n, size_t dim, float *distances) {
-  static constexpr size_t batch_size = 2;
+  static constexpr size_t batch_size = 4;
   static constexpr size_t prefetch_step = 2;
   const float *typed_query = static_cast<const float *>(query);
   size_t i = 0;

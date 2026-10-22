@@ -16,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <vector>
+#include <ailego/internal/cpu_features.h>
 #include <ailego/math/normalizer.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_factory.h>
@@ -23,6 +24,9 @@
 #include "avx2/fp16/inner_product.h"
 #include "avx2/fp16/squared_euclidean.h"
 #include "avx2/split_distance.h"
+#include "avx512/fp16/squared_euclidean.h"
+#include "avx512/split_distance.h"
+#include "avx512_vnni/fp16/squared_euclidean.h"
 #include "neon_fp16/fp16/squared_euclidean.h"
 
 namespace zvec {
@@ -84,6 +88,18 @@ SplitDistanceQuantizer::Distance Fp16Quantizer::split_distance() const {
           .target<decltype(&avx2::squared_euclidean_fp16_distance_avx2)>();
   const auto *batch = dp_query_batch_func_.target<
       decltype(&avx2::squared_euclidean_fp16_batch_distance_avx2)>();
+  const auto &features = ailego::internal::CpuFeatures::static_flags_;
+  const bool avx512_split = features.AVX512DQ && features.AVX512BW &&
+                            features.AVX512VL && features.F16C;
+  if (avx512_split && point && batch &&
+      original_dim_ % 16 == 0 &&
+      *point == avx512::squared_euclidean_fp16_distance_avx512 &&
+      *batch == avx512::squared_euclidean_fp16_batch_distance_avx512)
+    return avx512::squared_euclidean_fp16_split_batch;
+  if (avx512_split && point && batch && original_dim_ % 32 == 0 &&
+      *point == avx512_vnni::squared_euclidean_fp16_distance &&
+      *batch == avx512_vnni::squared_euclidean_fp16_batch_distance)
+    return avx512::squared_euclidean_raw_fp16_split_batch;
   if (point && batch && original_dim_ % 8 == 0) {
     if (*point == avx2::squared_euclidean_fp16_distance_avx2 &&
         *batch == avx2::squared_euclidean_fp16_batch_distance_avx2)

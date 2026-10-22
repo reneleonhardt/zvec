@@ -22,15 +22,16 @@
 #include <gtest/gtest.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include "distance/avx2/split_distance.h"
+#include "distance/avx512/split_distance.h"
 #include "quantizer/distance.h"
 
 namespace zvec::turbo {
 namespace {
 
 template <typename T>
-void CheckSplits(
-    DataType type, QuantizeType quantize,
-    const std::array<SplitDistanceQuantizer::Distance, 3> &splits) {
+void CheckSplits(DataType type, QuantizeType quantize,
+                 const std::array<SplitDistanceQuantizer::Distance, 3> &splits,
+                 CpuArchType arch = CpuArchType::kAVX2) {
   std::mt19937 generator(7391);
   std::uniform_real_distribution<float> random(-3.1f, 3.1f);
   const auto metrics = {MetricType::kSquaredEuclidean,
@@ -38,7 +39,8 @@ void CheckSplits(
   const int rounding = std::fegetround();
   for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
     ASSERT_EQ(0, std::fesetround(mode));
-    for (size_t dim : {8U, 32U, 64U, 96U, 256U, 768U}) {
+    for (size_t dim :
+         {8U, 15U, 16U, 17U, 31U, 32U, 33U, 64U, 96U, 256U, 768U}) {
       std::vector<T> query(dim), rows(9 * dim);
       for (auto &value : query) value = static_cast<T>(random(generator));
       for (auto &value : rows) value = static_cast<T>(random(generator));
@@ -56,8 +58,12 @@ void CheckSplits(
         }
         size_t metric_index = 0;
         for (auto metric : metrics) {
-          auto kernels =
-              get_distance_kernels(metric, type, quantize, CpuArchType::kAVX2);
+          if (quantize == QuantizeType::kRaw &&
+              metric != MetricType::kSquaredEuclidean) {
+            ++metric_index;
+            continue;
+          }
+          auto kernels = get_distance_kernels(metric, type, quantize, arch);
           if (!kernels.batch) {
             std::fesetround(rounding);
             GTEST_SKIP();
@@ -73,6 +79,14 @@ void CheckSplits(
                         nullptr);
           EXPECT_EQ(0, std::memcmp(expected.data(), batched.data(),
                                    sizeof(expected)));
+          const size_t alignment =
+              arch == CpuArchType::kAVX2
+                  ? 8
+                  : (quantize == QuantizeType::kRaw ? 32 : 16);
+          if (!splits[metric_index] || dim % alignment) {
+            ++metric_index;
+            continue;
+          }
           for (size_t cut : {0UL, 1UL, 7UL, 8UL, dim / 2 + 1, dim - 1, dim}) {
             std::array<SplitVector, 9> vectors;
             std::vector<T> suffix(9 * (dim - cut));
@@ -124,6 +138,24 @@ TEST(Avx2Distance, SplitAndFourRowBatchesPreserveExistingBatchBits) {
 #else
   GTEST_SKIP() << "AVX2 kernels require x86-64";
 #endif
+}
+
+TEST(TurboAvx512Distance, Fp32SplitAndWiderBatchPreserveBits) {
+  CheckSplits<float>(
+      DataType::kFp32, QuantizeType::kFp32,
+      {avx512::squared_euclidean_fp32_split_batch, nullptr, nullptr},
+      CpuArchType::kAVX512);
+}
+
+TEST(TurboAvx512Distance, Fp16SplitAndWiderBatchPreserveBits) {
+  CheckSplits<ailego::Float16>(
+      DataType::kFp16, QuantizeType::kFp16,
+      {avx512::squared_euclidean_fp16_split_batch, nullptr, nullptr},
+      CpuArchType::kAVX512);
+  CheckSplits<ailego::Float16>(
+      DataType::kFp16, QuantizeType::kRaw,
+      {avx512::squared_euclidean_raw_fp16_split_batch, nullptr, nullptr},
+      CpuArchType::kAVX512);
 }
 
 }  // namespace
