@@ -100,7 +100,9 @@ if(NOT ANDROID AND AUTO_DETECT_ARCH AND
     )
 
     # AVX2
-    file(GLOB_RECURSE AVX2_SRCS ${CMAKE_CURRENT_SOURCE_DIR}/distance/avx2/*.cc)
+    file(GLOB_RECURSE AVX2_SRCS
+        ${CMAKE_CURRENT_SOURCE_DIR}/distance/avx2/*.cc
+        ${CMAKE_CURRENT_SOURCE_DIR}/conversion/avx2/*.cc)
     set_source_files_properties(
         ${AVX2_SRCS}
         PROPERTIES

@@ -322,7 +322,7 @@ TEST(Fp16Quantizer, DecodePreservesBitsForEveryHalfEncoding) {
       ASSERT_EQ(0, quantizer->init(meta, params));
       for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
         ASSERT_EQ(0, std::fesetround(mode));
-        for (float norm : {0.f, -0.f, 1.f, -1.f, .003f, 2.3f, 1000.f,
+        for (float norm : {0.f, -0.f, 1.f, -1.f, .003f, 2.3f, 1000.f, 1.00048828125f, 0.0000000298023223876953125f,
                            std::numeric_limits<float>::infinity(),
                            std::numeric_limits<float>::quiet_NaN()}) {
           std::memcpy(encoded.data() + dim, &norm, sizeof(norm));

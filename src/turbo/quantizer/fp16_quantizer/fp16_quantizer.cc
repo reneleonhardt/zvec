@@ -27,6 +27,7 @@
 #include "avx512/fp16/squared_euclidean.h"
 #include "avx512/split_distance.h"
 #include "avx512_vnni/fp16/squared_euclidean.h"
+#include "conversion/avx2/cosine_decode.h"
 #include "neon_fp16/fp16/squared_euclidean.h"
 
 namespace zvec {
@@ -173,6 +174,12 @@ int Fp16Quantizer::dequantize(const void *in, const IndexQueryMeta &qmeta,
         reinterpret_cast<const uint8_t *>(in) + raw_dim * sizeof(uint16_t),
         extra_meta_size_);
     if (storage_data_type_ == IndexMeta::DT_FP16) {
+#if defined(__x86_64__) || defined(_M_X64)
+      const auto &features = ailego::internal::CpuFeatures::static_flags_;
+      if (features.AVX2 && features.F16C &&
+          avx2::fp16_cosine_decode(in_buf, raw_dim, norm, out_buf))
+        return 0;
+#endif
       const auto *in_fp16 = reinterpret_cast<const ailego::Float16 *>(in);
       for (size_t i = 0; i < raw_dim; ++i) {
         ailego::Float16 restored;
