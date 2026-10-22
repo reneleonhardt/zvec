@@ -326,12 +326,16 @@ TEST(Fp16Quantizer, DecodePreservesBitsForEveryHalfEncoding) {
                            std::numeric_limits<float>::infinity(),
                            std::numeric_limits<float>::quiet_NaN()}) {
           std::memcpy(encoded.data() + dim, &norm, sizeof(norm));
-          FloatHelper::ToFP32(encoded.data(), dim, expected.data());
-          if (cosine) {
-            for (float &value : expected) {
-              value *= norm;
-              if (physical) value = static_cast<float>(Float16(value));
+          if (cosine && physical) {
+            const auto *halves = reinterpret_cast<const Float16 *>(encoded.data());
+            for (size_t i = 0; i < dim; ++i) {
+              Float16 restored;
+              restored = static_cast<float>(halves[i]) * norm;
+              expected[i] = static_cast<float>(restored);
             }
+          } else {
+            FloatHelper::ToFP32(encoded.data(), dim, expected.data());
+            if (cosine) for (float &value : expected) value *= norm;
           }
           std::string decoded;
           ASSERT_EQ(0, quantizer->dequantize(encoded.data(), qmeta, &decoded));

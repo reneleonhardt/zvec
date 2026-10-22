@@ -176,7 +176,7 @@ int Fp16Quantizer::dequantize(const void *in, const IndexQueryMeta &qmeta,
     if (storage_data_type_ == IndexMeta::DT_FP16) {
 #if defined(__x86_64__) || defined(_M_X64)
       const auto &features = ailego::internal::CpuFeatures::static_flags_;
-      if (features.AVX2 && features.F16C &&
+      if (features.AVX2 && features.F16C && std::isfinite(norm) &&
           avx2::fp16_cosine_decode(in_buf, raw_dim, norm, out_buf))
         return 0;
 #endif
