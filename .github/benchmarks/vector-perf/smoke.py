@@ -14,7 +14,7 @@ with tempfile.TemporaryDirectory(prefix='vector-perf-smoke-') as temporary:
         subprocess.run([str(binary), mode, str(root), kind, storage, str(filtered)], check=True)
     run('prepare', 'flat', 'mmap')
     run('clonecheck', 'flat', 'mmap')
-    for kind in ('flat', 'fp16', 'ivf', 'physical', 'cos32', 'ip32'):
+    for kind in ('flat', 'fp16', 'ivf', 'physical', 'raw16', 'cos32', 'ip32'):
         run('fetchoracle', kind, 'mmap')
         for storage in ('mmap', 'bufferpool'):
             run('fetchcheck', kind, storage)

@@ -1,6 +1,10 @@
 cmake_minimum_required(VERSION 3.26)
 project(VectorPerf LANGUAGES C CXX)
 enable_testing()
+# Frozen sources use small-object storage through pointer-typed memory.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+  add_compile_options($<$<COMPILE_LANGUAGE:CXX>:-fno-strict-aliasing>)
+endif()
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5 CACHE STRING "Legacy vendored CMake compatibility")
 set(BUILD_C_BINDINGS OFF CACHE BOOL "" FORCE)
 set(BUILD_TOOLS OFF CACHE BOOL "" FORCE)

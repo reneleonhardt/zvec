@@ -73,7 +73,7 @@ for label, directory in [('main', main), ('before', before), ('candidate', candi
         for name in ('vector_system_search', 'vector_pool_workloads', 'libvector_alloc_probe.so')
     }
 (output / 'manifest.json').write_text(json.dumps(metadata, indent=2) + '\n')
-kinds = ('flat', 'fp16', 'ivf', 'physical', 'cos32', 'ip32')
+kinds = ('flat', 'fp16', 'ivf', 'physical', 'raw16', 'cos32', 'ip32')
 cpu_flags = Path('/proc/cpuinfo').read_text().lower()
 arches = ('auto', 'avx2') if platform.machine() == 'x86_64' and 'avx512f' in cpu_flags else ('auto',)
 for arch in arches:

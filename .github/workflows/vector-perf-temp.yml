@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 180
     env:
       BASELINE_SHA: 8d4996924bce78f8b072a353803c305101bcc807
-      BEFORE_SHA: 68a7b9eb563d2bf413bdb0b3abb3a7d1f301fea0
+      BEFORE_SHA: 7d3c08f193fb66737144bbc3efa21d5a5a778a31
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
       CCACHE_MAXSIZE: 3G
@@ -51,28 +51,30 @@ jobs:
             cmake --version
             ld --version
             ldd --version
-            grep -E '^(Model name|Flags):' results/cpu.txt
           } | sha256sum | cut -c 1-24)
           echo "key=$fingerprint" >> "$GITHUB_OUTPUT"
       - uses: actions/cache/restore@v6
-        id: references
+        id: main-reference
         with:
-          path: |
-            bench-main
-            bench-before
-          key: vector-perf-refs-v1-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ env.BASELINE_SHA }}-${{ env.BEFORE_SHA }}-${{ hashFiles('candidate/.github/benchmarks/vector-perf/*.cc', 'candidate/.github/benchmarks/vector-perf/*.h', 'candidate/.github/benchmarks/vector-perf/*.c', 'candidate/.github/benchmarks/vector-perf/CMakeLists.txt') }}
+          path: bench-main
+          key: vector-perf-main-v2-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ env.BASELINE_SHA }}-${{ hashFiles('candidate/.github/benchmarks/vector-perf/*.cc', 'candidate/.github/benchmarks/vector-perf/*.h', 'candidate/.github/benchmarks/vector-perf/*.c', 'candidate/.github/benchmarks/vector-perf/CMakeLists.txt') }}
+      - uses: actions/cache/restore@v6
+        id: before-reference
+        with:
+          path: bench-before
+          key: vector-perf-before-v2-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ env.BEFORE_SHA }}-${{ hashFiles('candidate/.github/benchmarks/vector-perf/*.cc', 'candidate/.github/benchmarks/vector-perf/*.h', 'candidate/.github/benchmarks/vector-perf/*.c', 'candidate/.github/benchmarks/vector-perf/CMakeLists.txt') }}
       - uses: actions/cache/restore@v6
         id: build-cache
         with:
           path: .ccache-vector-perf
           key: vector-perf-2604-gcc-${{ runner.arch }}-${{ github.sha }}
           restore-keys: vector-perf-2604-gcc-${{ runner.arch }}-
-      - name: Build frozen main and both candidates
+      - name: Build frozen references
         run: |
           set -euo pipefail
           cp -a candidate/.github/benchmarks/vector-perf benchmark-harness
           git -C candidate fetch --depth=1 origin "$BASELINE_SHA" "$BEFORE_SHA"
-          for pair in "main:$BASELINE_SHA" "before:$BEFORE_SHA" "candidate:$GITHUB_SHA"; do
+          for pair in "main:$BASELINE_SHA" "before:$BEFORE_SHA"; do
             label=${pair%%:*}
             revision=${pair#*:}
             if [[ -x "bench-$label/vector_system_search" ]]; then
@@ -96,14 +98,33 @@ jobs:
               exit 1
             fi
           done
-          ccache --show-stats > results/ccache.txt
       - uses: actions/cache/save@v6
-        if: steps.references.outputs.cache-hit != 'true'
+        if: steps.main-reference.outputs.cache-hit != 'true'
         with:
-          path: |
-            bench-main
-            bench-before
-          key: ${{ steps.references.outputs.cache-primary-key }}
+          path: bench-main
+          key: ${{ steps.main-reference.outputs.cache-primary-key }}
+      - uses: actions/cache/save@v6
+        if: steps.before-reference.outputs.cache-hit != 'true'
+        with:
+          path: bench-before
+          key: ${{ steps.before-reference.outputs.cache-primary-key }}
+      - name: Build candidate and validate arithmetic before timing
+        run: |
+          set -euo pipefail
+          git -C candidate checkout --detach "$GITHUB_SHA"
+          git -C candidate submodule update --init --recursive
+          nice -n 10 cmake -S benchmark-harness -B bench-build -G Ninja \
+            -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE/candidate" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          nice -n 10 cmake --build bench-build --target vector_system_search vector_pool_workloads vector_alloc_probe turbo_avx2_distance_test turbo_fp16_quantizer_test --parallel 4
+          mkdir bench-candidate
+          cp bench-build/vector_system_search bench-build/vector_pool_workloads bench-build/libvector_alloc_probe.so bench-candidate/
+          echo "$GITHUB_SHA" > bench-candidate/source-sha.txt
+          ldd bench-candidate/vector_system_search > results/candidate-libraries.txt
+          if grep -q '/bench-build/' results/candidate-libraries.txt; then exit 1; fi
+          nice -n 10 bench-build/zvec/bin/turbo_avx2_distance_test > results/arithmetic-check.txt 2>&1
+          nice -n 10 bench-build/zvec/bin/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization >> results/arithmetic-check.txt 2>&1
+          ccache --show-stats > results/ccache.txt
       - uses: actions/cache/save@v6
         if: always() && steps.build-cache.outputs.cache-hit != 'true'
         with:
@@ -120,7 +141,6 @@ jobs:
           perf_bin=$(find /usr/lib/linux-tools -type f -name perf | sort | head -n 1)
           sudo sysctl -w kernel.perf_event_paranoid=1
           profile_arch=auto
-          if [[ -d results/avx2 ]]; then profile_arch=avx2; fi
           export VECTOR_PERF_ARCH="$profile_arch"
           "$perf_bin" record -e cycles:u -g --call-graph dwarf -o results/ivf-search.perf -- \
             bench-candidate/vector_system_search warm "$GITHUB_WORKSPACE/results/$profile_arch" ivf bufferpool 0 4 8 1 > results/profile-search.csv 2> results/profile-search.log
@@ -128,6 +148,14 @@ jobs:
           "$perf_bin" record -e cycles:u -g --call-graph dwarf -o results/ivf-write.perf -- \
             bench-candidate/vector_pool_workloads write "$GITHUB_WORKSPACE/results/$profile_arch" ivf bufferpool 8193 20 128 > results/profile-write.csv 2> results/profile-write.log
           "$perf_bin" report -i results/ivf-write.perf --stdio > results/ivf-write-profile.txt
+          for kind in flat fp16 raw16 physical; do
+            "$perf_bin" record -e cycles:u -g --call-graph dwarf -o "results/$kind-search.perf" -- \
+              bench-candidate/vector_system_search warm "$GITHUB_WORKSPACE/results/auto" "$kind" bufferpool 0 1 8 1 > "results/profile-$kind.csv" 2> "results/profile-$kind.log"
+            "$perf_bin" report -i "results/$kind-search.perf" --stdio > "results/$kind-search-profile.txt"
+          done
+          "$perf_bin" record -e cycles:u -g --call-graph dwarf -o results/physical-fetch.perf -- \
+            bench-candidate/vector_system_search fetchwarm "$GITHUB_WORKSPACE/results/auto" physical bufferpool 0 1 8 1 > results/profile-fetch.csv 2> results/profile-fetch.log
+          "$perf_bin" report -i results/physical-fetch.perf --stdio > results/physical-fetch-profile.txt
       - uses: actions/upload-artifact@v7
         if: always()
         with:

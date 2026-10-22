@@ -57,15 +57,17 @@ static ci::BaseIndexParam::Pointer params(const Fixture &f,
         .with_n_list(64)
         .with_n_iters(8)
         .build();
-  if (kind == "physical" || kind == "cos32" || kind == "ip32")
+  if (kind == "physical" || kind == "raw16" || kind == "cos32" || kind == "ip32")
     return ci::FlatIndexParamBuilder()
-        .with_metric_type(kind == "ip32" ? ci::MetricType::kInnerProduct
-                                         : ci::MetricType::kCosine)
+        .with_metric_type(kind == "raw16" ? ci::MetricType::kL2sq
+                          : kind == "ip32" ? ci::MetricType::kInnerProduct
+                                           : ci::MetricType::kCosine)
         .with_data_type(ci::DataType::DT_FP32)
         .with_dimension(f.dim)
         .with_use_contiguous_memory(false)
-        .with_storage_data_type(kind == "physical" ? ci::DataType::DT_FP16
-                                                   : ci::DataType::DT_UNDEFINED)
+        .with_storage_data_type(kind == "physical" || kind == "raw16"
+                                    ? ci::DataType::DT_FP16
+                                    : ci::DataType::DT_UNDEFINED)
         .build();
   auto p = ci::FlatIndexParamBuilder()
                .with_metric_type(ci::MetricType::kL2sq)
@@ -80,7 +82,7 @@ static ci::BaseIndexParam::Pointer params(const Fixture &f,
 }
 static void prepare(const Fixture &f, const std::string &root) {
   for (const std::string kind :
-       {"flat", "fp16", "ivf", "physical", "cos32", "ip32"}) {
+       {"flat", "fp16", "ivf", "physical", "raw16", "cos32", "ip32"}) {
     auto index = ci::IndexFactory::CreateAndInitIndex(*params(f, kind));
     require(bool(index));
     require(index->open(root + "/" + kind + ".index",
