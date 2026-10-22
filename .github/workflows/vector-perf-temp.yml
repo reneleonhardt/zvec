@@ -52,6 +52,13 @@ jobs:
         with:
           submodules: recursive
           path: candidate
+      - name: Check FP32 arithmetic before building project libraries
+        run: |
+          set -euo pipefail
+          git -C candidate fetch --depth=1 origin "$BASELINE_SHA"
+          nice -n 10 python3 candidate/.github/benchmarks/vector-perf/fp32_preflight.py \
+            --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$BASELINE_SHA" \
+            > results/early-fp32-check.txt 2>&1
       - name: Identify compatible reference binaries
         id: toolchain
         run: |
