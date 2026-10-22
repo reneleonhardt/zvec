@@ -14,7 +14,8 @@ jobs:
     timeout-minutes: 180
     env:
       BASELINE_SHA: 8d4996924bce78f8b072a353803c305101bcc807
-      BEFORE_SHA: 0659259a7fae0f5d0fec5337e82a37b975db7a6a
+      BEFORE_SHA: 39f876236f64034da9b03a64621a94ef43da9c97
+      EXACT_REFERENCE_SHA: 0659259a7fae0f5d0fec5337e82a37b975db7a6a
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
       CCACHE_MAXSIZE: 3G
@@ -72,6 +73,25 @@ jobs:
           path: bench-before
           key: vector-perf-before-v2-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ env.BEFORE_SHA }}-${{ hashFiles('candidate/.github/benchmarks/vector-perf/*.cc', 'candidate/.github/benchmarks/vector-perf/*.h', 'candidate/.github/benchmarks/vector-perf/*.c', 'candidate/.github/benchmarks/vector-perf/CMakeLists.txt') }}
       - uses: actions/cache/restore@v6
+        id: before-candidate
+        if: steps.before-reference.outputs.cache-hit != 'true'
+        with:
+          path: bench-candidate
+          key: vector-perf-candidate-v1-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ env.BEFORE_SHA }}
+      - name: Reuse the previous validated candidate as the reference
+        if: steps.before-reference.outputs.cache-hit != 'true' && steps.before-candidate.outputs.cache-hit == 'true'
+        run: |
+          set -euo pipefail
+          test "$(cat bench-candidate/source-sha.txt)" = "$BEFORE_SHA"
+          git -C candidate fetch --depth=1 origin "$BEFORE_SHA"
+          if git -C candidate diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- \
+            '.github/benchmarks/vector-perf/*.cc' '.github/benchmarks/vector-perf/*.h' \
+            '.github/benchmarks/vector-perf/*.c' '.github/benchmarks/vector-perf/CMakeLists.txt'; then
+            mv bench-candidate bench-before
+          else
+            rm -rf bench-candidate
+          fi
+      - uses: actions/cache/restore@v6
         id: build-cache
         with:
           path: .ccache-vector-perf
@@ -86,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           cp -a candidate/.github/benchmarks/vector-perf benchmark-harness
-          git -C candidate fetch --depth=1 origin "$BASELINE_SHA" "$BEFORE_SHA"
+          git -C candidate fetch --depth=1 origin "$BASELINE_SHA" "$BEFORE_SHA" "$EXACT_REFERENCE_SHA"
           for pair in "main:$BASELINE_SHA" "before:$BEFORE_SHA"; do
             label=${pair%%:*}
             revision=${pair#*:}
@@ -140,16 +160,26 @@ jobs:
           cp build-candidate/zvec/lib/libcore_metric.so build-candidate/zvec/lib/libcore_quantizer.so bench-candidate/lib/
           echo "$GITHUB_SHA" > bench-candidate/source-sha.txt
           nice -n 10 python3 benchmark-harness/exact_bits.py \
-            --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$BEFORE_SHA" \
+            --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$EXACT_REFERENCE_SHA" \
             --build-root "$GITHUB_WORKSPACE/build-candidate" \
             --output "$GITHUB_WORKSPACE/bench-candidate/exact-bits" --build-only \
             > results/original-symbol-build.txt 2>&1
+          nice -n 10 python3 benchmark-harness/exact_bits.py \
+            --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$BASELINE_SHA" \
+            --build-root "$GITHUB_WORKSPACE/build-candidate" --distance-only \
+            --output "$GITHUB_WORKSPACE/bench-candidate/main-exact-bits" --build-only \
+            > results/main-symbol-build.txt 2>&1
+          nice -n 10 python3 benchmark-harness/split_exact_bits.py \
+            --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$BASELINE_SHA" \
+            --build-root "$GITHUB_WORKSPACE/build-candidate" \
+            --output "$GITHUB_WORKSPACE/bench-candidate/split-exact-bits" --build-only \
+            > results/split-symbol-build.txt 2>&1
       - name: Validate cached candidate on this CPU before timing
         run: |
           set -euo pipefail
           test "$(cat bench-candidate/source-sha.txt)" = "$GITHUB_SHA"
           export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bench-candidate/lib"
-          for binary in vector_system_search vector_pool_workloads turbo_avx2_distance_test turbo_fp16_quantizer_test exact-bits; do
+          for binary in vector_system_search vector_pool_workloads turbo_avx2_distance_test turbo_fp16_quantizer_test exact-bits main-exact-bits split-exact-bits; do
             test -x "bench-candidate/$binary"
             ldd "bench-candidate/$binary" >> results/candidate-libraries.txt
           done
@@ -158,8 +188,12 @@ jobs:
           failed=0
           nice -n 10 bench-candidate/turbo_avx2_distance_test > results/arithmetic-check.txt 2>&1 || failed=1
           nice -n 10 bench-candidate/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.CosineDecodePreservesBitsAndExceptionFlags:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization >> results/arithmetic-check.txt 2>&1 || failed=1
-          printf 'Frozen source: %s; candidate: %s\n' "$BEFORE_SHA" "$GITHUB_SHA" > results/original-symbol-check.txt
+          printf 'Frozen source: %s; candidate: %s\n' "$EXACT_REFERENCE_SHA" "$GITHUB_SHA" > results/original-symbol-check.txt
           nice -n 10 bench-candidate/exact-bits >> results/original-symbol-check.txt 2>&1 || failed=1
+          printf 'Frozen source: %s; candidate: %s\n' "$BASELINE_SHA" "$GITHUB_SHA" > results/main-symbol-check.txt
+          nice -n 10 bench-candidate/main-exact-bits >> results/main-symbol-check.txt 2>&1 || failed=1
+          printf 'Frozen source: %s; candidate: %s\n' "$BASELINE_SHA" "$GITHUB_SHA" > results/split-symbol-check.txt
+          nice -n 10 bench-candidate/split-exact-bits >> results/split-symbol-check.txt 2>&1 || failed=1
           ccache --show-stats > results/ccache.txt
           exit "$failed"
       - uses: actions/cache/save@v6
