@@ -264,6 +264,7 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
   auto cleanup = ScopeGuard::Make([&]() { EXPECT_EQ(0, pool.init(capacity)); });
   for (int format : {0, 1, 2, 3, 4}) {
     const size_t dimension = format == 2 || format == 4 ? 768 : 769;
+    const uint32_t count = format == 3 ? 1025 : 65;
     const char *quantizer_name = format == 0   ? nullptr
                                 : format == 1 || format == 4 ? "Fp16Quantizer"
                                               : "Fp32Quantizer";
@@ -292,7 +293,7 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
     ASSERT_EQ(0, storage->open(path, true));
     ASSERT_EQ(0, streamer->open(storage));
     auto context = streamer->create_context();
-    for (uint32_t id = 0; id < 65; ++id) {
+    for (uint32_t id = 0; id < count; ++id) {
       if (id == 63) continue;
       const std::vector<float> row(dimension, float(id));
       std::string code(meta.element_size(), '\0');
@@ -306,6 +307,7 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
     context.reset();
     ASSERT_EQ(0, streamer->close());
     ASSERT_EQ(0, storage->close());
+    streamer->set_read_only(true);
     for (size_t budget : {64UL << 20, 1UL}) {
       ASSERT_EQ(0, pool.init(budget));
       ASSERT_EQ(0, storage->open(path, false));
@@ -315,7 +317,7 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
       context->set_topk(3);
       auto *scratch = static_cast<FlatStreamerContext<32> *>(context.get())
                           ->search_scratch();
-      if (borrowed) {
+      if (borrowed && format != 3) {
         context->set_filter([](uint64_t id) { return id % 2 == 0; });
         ASSERT_EQ(0, streamer->search_bf_impl(
                          quantizer ? static_cast<const void *>(query_code.data())
@@ -339,7 +341,7 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
                                 : query.data(),
                       qmeta, context));
         std::vector<std::pair<float, uint64_t>> expected;
-        for (uint64_t id = 0; id < 65; ++id)
+        for (uint64_t id = 0; id < count; ++id)
           if (id != 63 && !excluded(id))
             expected.emplace_back(
                 float(dimension) * std::pow(float(id) - 51.25f, 2), id);
@@ -348,9 +350,9 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
                   context->result().size());
         auto *stats = static_cast<FlatStreamerContext<32> *>(context.get())
                           ->mutable_stats();
-        EXPECT_EQ(borrowed || mode ? expected.size() : 65,
+        EXPECT_EQ(borrowed || mode ? expected.size() : count,
                   stats->dist_calced_count());
-        EXPECT_EQ(borrowed || mode ? 65 - expected.size() : 0,
+        EXPECT_EQ(borrowed || mode ? count - expected.size() : 0,
                   stats->filtered_count());
         for (size_t i = 0; i < context->result().size(); ++i) {
           EXPECT_EQ(expected[i].second, context->result()[i].key());

@@ -566,6 +566,27 @@ int FlatStreamerEntity::search_borrowed_block(
   });
   resident = borrowed_pool_->try_acquire_resident_pages(
       page_ids.data(), page_ids.size(), pages.data());
+#if defined(__APPLE__)
+  if (!resident && read_only_ && !filter.is_valid() &&
+      index_meta_.data_type() == IndexMeta::DT_FP32 &&
+      linear_list_count() == 1 && !borrowed_pool_->has_evicted()) {
+    const auto budget = ailego::MemoryLimitPool::get_instance().stats();
+    const size_t file_bytes = borrowed_pool_->file_size();
+    if (vector_count() >= file_bytes / (2 * stride) &&
+        budget.used <= budget.pool_size &&
+        file_bytes <= budget.pool_size - budget.used) {
+      // A dense immutable scan can replace per-block I/O with bulk reads.
+      std::lock_guard<std::mutex> guard(cold_read_mutex_);
+      resident = borrowed_pool_->try_acquire_resident_pages(
+          page_ids.data(), page_ids.size(), pages.data());
+      if (!resident) {
+        borrowed_pool_->warmup();
+        resident = borrowed_pool_->try_acquire_resident_pages(
+            page_ids.data(), page_ids.size(), pages.data());
+      }
+    }
+  }
+#endif
   auto &pointers = scratch->vector_ptrs;
   pointers.clear();
   if (resident && split_distance_) {
@@ -659,7 +680,7 @@ int FlatStreamerEntity::search_borrowed_block(
 #if defined(__APPLE__)
 void FlatStreamerEntity::prefault_cold_mmap(const void *const *vectors,
                                            size_t count) const {
-  std::lock_guard<std::mutex> guard(mmap_prefault_mutex_);
+  std::lock_guard<std::mutex> guard(cold_read_mutex_);
   if (mmap_prefault_state_.load(std::memory_order_relaxed) == MmapPrefaultState::Done)
     return;
   const size_t page_size = ailego::kVectorPageSize;

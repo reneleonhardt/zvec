@@ -536,7 +536,7 @@ class FlatStreamerEntity {
   void prefault_cold_mmap(const void *const *vectors, size_t count) const;
   enum class MmapPrefaultState { Unprobed, Cold, Done };
   mutable std::atomic<MmapPrefaultState> mmap_prefault_state_{MmapPrefaultState::Done};
-  mutable std::mutex mmap_prefault_mutex_{};
+  mutable std::mutex cold_read_mutex_{};
 #endif
   int search_borrowed_block(
       const void *query, const BlockLocation &block, const BlockHeader *header,
