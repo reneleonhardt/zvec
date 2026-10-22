@@ -455,3 +455,20 @@ TEST(Cube, EnumObject) {
   EXPECT_EQ(a, e);
   EXPECT_EQ(b, f);
 }
+
+TEST(Cube, SmallValuesSurviveMovesAndSwaps) {
+  for (int value : {1, -17, 65537}) {
+    Cube source(value);
+    Cube moved(std::move(source));
+    EXPECT_TRUE(source.empty());
+    EXPECT_EQ(value, moved.cast<int>());
+    Cube assigned;
+    assigned = std::move(moved);
+    EXPECT_TRUE(moved.empty());
+    EXPECT_EQ(value, assigned.cast<int>());
+    Cube other(3.25f);
+    assigned.swap(other);
+    EXPECT_EQ(value, other.cast<int>());
+    EXPECT_EQ(3.25f, assigned.cast<float>());
+  }
+}

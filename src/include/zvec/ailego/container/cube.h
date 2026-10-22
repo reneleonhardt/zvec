@@ -14,6 +14,8 @@
 
 #pragma once
 
+#include <cstring>
+
 #include <algorithm>
 #include <string>
 #include <typeinfo>
@@ -201,7 +203,9 @@ class Cube {
   }
 
   //! Constructor
-  Cube(Cube &&rhs) : policy_(rhs.policy_), object_(rhs.object_) {
+  Cube(Cube &&rhs) : policy_(rhs.policy_), object_(nullptr) {
+    // Small values occupy this storage without having pointer type.
+    std::memcpy(&object_, &rhs.object_, sizeof(object_));
     rhs.policy_ = Cube::Policy<Cube::EmptyPolicy>();
     rhs.object_ = nullptr;
   }
@@ -293,7 +297,7 @@ class Cube {
     if (this != &rhs) {
       policy_->cleanup(&object_);
       policy_ = rhs.policy_;
-      object_ = rhs.object_;
+      std::memcpy(&object_, &rhs.object_, sizeof(object_));
       rhs.policy_ = Cube::Policy<Cube::EmptyPolicy>();
       rhs.object_ = nullptr;
     }
@@ -318,7 +322,10 @@ class Cube {
   //! Swap the content with another Cube
   Cube &swap(Cube &rhs) {
     std::swap(policy_, rhs.policy_);
-    std::swap(object_, rhs.object_);
+    unsigned char temporary[sizeof(object_)];
+    std::memcpy(temporary, &object_, sizeof(object_));
+    std::memcpy(&object_, &rhs.object_, sizeof(object_));
+    std::memcpy(&rhs.object_, temporary, sizeof(object_));
     return *this;
   }
 

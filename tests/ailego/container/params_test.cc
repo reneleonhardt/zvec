@@ -389,3 +389,11 @@ TEST(Params, SerializeToBuffer) {
   EXPECT_TRUE(Params::ParseFromBuffer(str1, &params1));
   EXPECT_EQ(str1, params1.debug_string());
 }
+
+TEST(Params, SmallIntegerSurvivesInsertion) {
+  Params params;
+  params.set("precision", int32_t(1));
+  int64_t value = 0;
+  ASSERT_TRUE(params.get("precision", &value));
+  EXPECT_EQ(1, value);
+}
