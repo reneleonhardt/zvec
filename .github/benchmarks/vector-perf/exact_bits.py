@@ -40,6 +40,8 @@ template <class T> T value(uint32_t bits) {
 uint32_t bits(float v) { uint32_t b; std::memcpy(&b, &v, sizeof(b)); return b; }
 template <class T> size_t check(const char *name, Batch current, Batch original) {
   size_t failures = 0, comparisons = 0;
+  const int rounding = std::fegetround();
+  const unsigned original_csr = _mm_getcsr();
   std::mt19937 random(7391);
   constexpr bool half = !std::is_same_v<T, float>;
   const uint32_t sign = half ? 0x8000U : 0x80000000U;
@@ -48,7 +50,7 @@ template <class T> size_t check(const char *name, Batch current, Batch original)
   for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
     std::fesetround(mode);
     for (size_t dim : {8U, 15U, 16U, 17U, 31U, 32U, 33U, 64U, 96U, 256U, 768U}) {
-      for (int special = 0; special < 8; ++special) {
+      for (int special = 0; special < 10; ++special) {
         std::vector<T> query(dim), rows(32 * dim);
         for (auto *values : {&query, &rows}) {
           for (T &x : *values) {
@@ -91,6 +93,27 @@ template <class T> size_t check(const char *name, Batch current, Batch original)
           for (size_t row = 0; row < 32; ++row)
             for (size_t d = 0; d < dim; ++d)
               rows[row * dim + d] = value<T>(largest | ((row & 1) ? sign : 0));
+        } else if (special == 8) {
+          if constexpr (!half) {
+            for (T &x : query) x = value<T>(0x1c800000U);
+            for (T &x : rows) x = value<T>(0x1c800000U);
+          }
+        } else if (special == 9) {
+          if constexpr (!half) {
+            for (T &x : query) x = value<T>(0);
+            for (T &x : rows) x = value<T>(0);
+            const size_t width = std::strstr(name, "avx2/") == name ? 8 : 16;
+            if (dim >= width) {
+              const size_t start = dim / width * width - width;
+              const size_t other = start + (width == 8 ? 2 : 1);
+              query[start] = value<T>(0x1f800000U);
+              query[other] = value<T>(0x1f800001U);
+              for (size_t row = 0; row < 32; ++row) {
+                rows[row * dim + start] = value<T>(0x20800000U);
+                rows[row * dim + other] = value<T>(0xa0800000U);
+              }
+            }
+          }
         }
         std::array<const void *, 32> pointers;
         for (size_t row = 0; row < pointers.size(); ++row) pointers[row] = rows.data() + row * dim;
@@ -100,15 +123,19 @@ template <class T> size_t check(const char *name, Batch current, Batch original)
           expected.fill(value<float>(0xdeadbeefU));
           actual = expected;
           std::feclearexcept(FE_ALL_EXCEPT);
+          _mm_setcsr(_mm_getcsr() & ~0x3fu);
           original(pointers.data(), query.data(), count, dim, expected.data() + 1, nullptr);
           const int expected_flags = std::fetestexcept(FE_ALL_EXCEPT);
+          const unsigned expected_csr = _mm_getcsr() & 0x3fu;
           std::feclearexcept(FE_ALL_EXCEPT);
+          _mm_setcsr(_mm_getcsr() & ~0x3fu);
           current(pointers.data(), query.data(), count, dim, actual.data() + 1, nullptr);
           const int actual_flags = std::fetestexcept(FE_ALL_EXCEPT);
+          const unsigned actual_csr = _mm_getcsr() & 0x3fu;
           ++comparisons;
-          if (expected_flags != actual_flags && failures++ < 16)
-            std::fprintf(stderr, "%s dim=%zu count=%zu mode=%d case=%d expected-flags=%x actual-flags=%x\n",
-                         name, dim, count, mode, special, expected_flags, actual_flags);
+          if ((expected_flags != actual_flags || expected_csr != actual_csr) && failures++ < 16)
+            std::fprintf(stderr, "%s dim=%zu count=%zu mode=%d case=%d expected-flags=%x actual-flags=%x expected-MXCSR=%x actual-MXCSR=%x\n",
+                         name, dim, count, mode, special, expected_flags, actual_flags, expected_csr, actual_csr);
           for (size_t row = 0; row < actual.size(); ++row) {
             const uint32_t wanted = row && row <= count ? bits(expected[row]) : 0xdeadbeefU;
             if (bits(actual[row]) == wanted && bits(expected[row]) == wanted) continue;
@@ -120,7 +147,8 @@ template <class T> size_t check(const char *name, Batch current, Batch original)
       }
     }
   }
-  std::fesetround(FE_TONEAREST);
+  std::fesetround(rounding);
+  _mm_setcsr(original_csr);
   std::printf("%s: %zu comparisons, %zu output/flag differences\n", name, comparisons, failures);
   return failures;
 }

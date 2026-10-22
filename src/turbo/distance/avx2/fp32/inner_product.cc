@@ -64,29 +64,19 @@ void inner_product_batch_impl(
   size_t dim = 0;
   for (; dim + 8 <= dimensionality; dim += 8) {
     const __m256 q = _mm256_loadu_ps(query + dim);
-    if constexpr (dp_batch == 8) {
-      // Load each row at its FMA to leave room for all eight accumulators.
-      for (size_t i = 0; i < dp_batch; ++i) {
-        accs[i] = _mm256_fmadd_ps(q, _mm256_loadu_ps(ptrs[i] + dim), accs[i]);
-        if (prefetch_ptrs[i]) {
-          ailego_prefetch(prefetch_ptrs[i] + dim);
-        }
-      }
-    } else {
-      __m256 data_regs[dp_batch];
-      for (size_t i = 0; i < dp_batch; ++i) {
-        data_regs[i] = _mm256_loadu_ps(ptrs[i] + dim);
-      }
+    __m256 data_regs[dp_batch];
+    for (size_t i = 0; i < dp_batch; ++i) {
+      data_regs[i] = _mm256_loadu_ps(ptrs[i] + dim);
+    }
 
-      if (prefetch_ptrs[0]) {
-        for (size_t i = 0; i < dp_batch; ++i) {
-          ailego_prefetch(prefetch_ptrs[i] + dim);
-        }
-      }
-
+    if (prefetch_ptrs[0]) {
       for (size_t i = 0; i < dp_batch; ++i) {
-        accs[i] = _mm256_fmadd_ps(q, data_regs[i], accs[i]);
+        ailego_prefetch(prefetch_ptrs[i] + dim);
       }
+    }
+
+    for (size_t i = 0; i < dp_batch; ++i) {
+      accs[i] = _mm256_fmadd_ps(q, data_regs[i], accs[i]);
     }
   }
 
@@ -114,20 +104,6 @@ void inner_product_batch(const void *const *vectors, const void *query,
   static constexpr size_t prefetch_step = 2;
   const float *typed_query = static_cast<const float *>(query);
   size_t i = 0;
-  if (dim % 8 == 0) {
-    for (; i + 8 <= n; i += 8) {
-      std::array<const float *, 8> prefetch_ptrs{};
-      for (size_t j = 0; j < prefetch_ptrs.size(); ++j) {
-        if (i + j + batch_size * prefetch_step < n) {
-          prefetch_ptrs[j] = static_cast<const float *>(
-              vectors[i + j + batch_size * prefetch_step]);
-        }
-      }
-      inner_product_batch_impl<8>(
-          typed_query, reinterpret_cast<const float *const *>(&vectors[i]),
-          prefetch_ptrs, dim, distances + i);
-    }
-  }
   for (; i + batch_size <= n; i += batch_size) {
     std::array<const float *, batch_size> prefetch_ptrs;
     for (size_t j = 0; j < batch_size; ++j) {
@@ -166,7 +142,7 @@ void inner_product_fp32_distance_avx2(const void *a, const void *b, size_t dim,
 #endif
 }
 
-void inner_product_fp32_batch_distance_avx2(
+void inner_product_fp32_batch_distance_avx2_legacy(
     const void *const *vectors, const void *query, size_t n, size_t dim,
     float *distances, const void *const * /*extra_values*/) {
 #if defined(__AVX2__)
