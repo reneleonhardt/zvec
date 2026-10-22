@@ -22,6 +22,8 @@
 #include <zvec/core/framework/index_factory.h>
 #include "core/quantizer/record_quantizer.h"
 #include "neon/fp32/squared_euclidean.h"
+#include "neon/fp32/inner_product.h"
+#include "neon/fp32/cosine.h"
 
 namespace zvec {
 namespace turbo {
@@ -151,6 +153,12 @@ SplitDistanceQuantizer::Distance Fp32Quantizer::split_distance() const {
   if (kernel && *kernel == neon::squared_euclidean_fp32_distance &&
       original_dim_ % 8 == 0)
     return neon::squared_euclidean_fp32_bounded_split_batch_distance;
+  if (kernel && original_dim_ % 8 == 0) {
+    if (*kernel == neon::inner_product_fp32_distance)
+      return neon::inner_product_fp32_split_batch_distance;
+    if (*kernel == neon::cosine_fp32_distance)
+      return neon::cosine_fp32_split_batch_distance;
+  }
 #endif
   return nullptr;
 }

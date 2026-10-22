@@ -553,6 +553,7 @@ int FlatStreamerEntity::search_borrowed_block(
   if (resident && split_distance_) {
     auto &vectors = scratch->split_vectors;
     vectors.clear();
+    vectors.reserve(header->vector_count);
     for (size_t k = 0; k < header->vector_count; ++k) {
       if (!keeps.test(k)) continue;
       const size_t position = absolute + k * stride;
@@ -683,8 +684,9 @@ void FlatStreamerEntity::prefault_cold_mmap(const void *const *vectors,
 bool FlatStreamerEntity::try_bounded_distances(
     const void *query, const void *const *vectors, size_t count, float *distances,
     FlatSearchScratch *scratch, const IndexDocumentHeap *heap) const {
-  if (!split_distance_ || !scratch || count < 4 ||
-      index_meta_.dimension() <= 64 || !heap->full() || heap->empty())
+  if (!split_distance_ || index_meta_.metric_name() != "SquaredEuclidean" ||
+      !scratch || count < 4 || index_meta_.dimension() <= 64 || !heap->full() ||
+      heap->empty())
     return false;
 #if defined(__APPLE__)
   if (mmap_prefault_state_.load(std::memory_order_relaxed) != MmapPrefaultState::Done)

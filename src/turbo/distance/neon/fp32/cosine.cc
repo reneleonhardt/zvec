@@ -33,4 +33,14 @@ void cosine_fp32_batch_distance(const void *const *vectors, const void *query,
   }
 }
 
+bool cosine_fp32_split_batch_distance(const SplitVector *vectors, size_t count,
+                                      const void *query, size_t dim,
+                                      float *distances, float cutoff) {
+  if (!inner_product_fp32_split_batch_distance(vectors, count, query, dim,
+                                               distances, cutoff))
+    return false;
+  for (size_t i = 0; i < count; ++i) distances[i] += 1.0f;
+  return true;
+}
+
 }  // namespace zvec::turbo::neon

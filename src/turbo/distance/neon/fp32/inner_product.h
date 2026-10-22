@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstddef>
+#include "quantizer/split_distance_quantizer.h"
 
 namespace zvec::turbo::neon {
 
@@ -27,5 +28,10 @@ void inner_product_fp32_batch_distance(const void *const *vectors,
                                        const void *query, size_t n, size_t dim,
                                        float *distances,
                                        const void *const *extra_values);
+
+bool inner_product_fp32_split_batch_distance(const SplitVector *vectors,
+                                             size_t count, const void *query,
+                                             size_t dim, float *distances,
+                                             float cutoff);
 
 }  // namespace zvec::turbo::neon

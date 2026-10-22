@@ -24,6 +24,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
@@ -370,21 +371,30 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
 }
 
 TEST_F(FlatStreamerTest, FilteredQuantizerBatchesMatchScalarDistances) {
-  for (const auto &[name, dimension] :
-       {std::pair{"Fp32Quantizer", 17U}, std::pair{"Fp16Quantizer", 17U},
-        std::pair{"Fp32Quantizer", 80U}, std::pair{"Fp16Quantizer", 80U}}) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const auto capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto cleanup = ScopeGuard::Make([&]() { EXPECT_EQ(0, pool.init(capacity)); });
+  for (const auto &[name, dimension, metric, storage_name] :
+       {std::tuple{"Fp32Quantizer", 17U, "SquaredEuclidean", "MMapFileStorage"},
+        std::tuple{"Fp16Quantizer", 17U, "SquaredEuclidean", "MMapFileStorage"},
+        std::tuple{"Fp32Quantizer", 80U, "SquaredEuclidean", "MMapFileStorage"},
+        std::tuple{"Fp16Quantizer", 80U, "SquaredEuclidean", "MMapFileStorage"},
+        std::tuple{"Fp32Quantizer", 768U, "Cosine", "BufferStorage"},
+        std::tuple{"Fp32Quantizer", 768U, "InnerProduct", "BufferStorage"}}) {
     SCOPED_TRACE(name);
     IndexMeta raw_meta(IndexMeta::DT_FP32, dimension);
-    raw_meta.set_metric("SquaredEuclidean", 0, Params());
+    raw_meta.set_metric(metric, 0, Params());
     auto quantizer = IndexFactory::CreateQuantizer(name);
     ASSERT_EQ(0, quantizer->init(raw_meta, Params()));
     IndexMeta meta = quantizer->meta();
     meta.set_quantizer(name, 0, Params());
     auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
     ASSERT_EQ(0, streamer->init(meta, Params(), quantizer));
-    auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+    auto storage = IndexFactory::CreateStorage(storage_name);
     ASSERT_EQ(0, storage->init(Params()));
-    ASSERT_EQ(0, storage->open(dir_ + name + std::to_string(dimension), true));
+    const auto path = dir_ + name + std::to_string(dimension) + metric;
+    ASSERT_EQ(0, storage->open(path, true));
     ASSERT_EQ(0, streamer->open(storage));
     auto context = streamer->create_context();
     context->set_topk(5);
@@ -397,11 +407,24 @@ TEST_F(FlatStreamerTest, FilteredQuantizerBatchesMatchScalarDistances) {
     for (size_t id = 0; id < codes.size(); ++id) {
       std::vector<float> row(dimension);
       for (size_t d = 0; d < dimension; ++d)
-        row[d] = float((id * 37 % codes.size()) * 17 + d) * .0031f;
+        row[d] =
+            float(int((id * 37 + d * 19 + id * d * 7) % 997) - 498) * .0031f;
       codes[id].resize(quantizer->quantized_datapoint_vector_length());
       quantizer->quantize_data(row.data(), codes[id].data());
       ASSERT_EQ(0, streamer->add_impl(id, codes[id].data(), qmeta, context));
     }
+    const bool borrowed = std::strcmp(storage_name, "BufferStorage") == 0;
+    if (borrowed) {
+      ASSERT_EQ(0, streamer->flush(0));
+      context.reset();
+      ASSERT_EQ(0, streamer->close());
+      ASSERT_EQ(0, storage->close());
+      ASSERT_EQ(0, storage->open(path, false));
+      ASSERT_EQ(0, streamer->open(storage));
+      context = streamer->create_context();
+      context->set_topk(5);
+    }
+    [[maybe_unused]] bool warmed = false;
     for (int mode : {0, 1, 2, 3, 0}) {
       auto excluded = [mode](uint64_t id) {
         return mode == 1   ? id % 2 == 0
@@ -424,6 +447,15 @@ TEST_F(FlatStreamerTest, FilteredQuantizerBatchesMatchScalarDistances) {
         EXPECT_EQ(expected[i].second, context->result()[i].key());
         const float actual = context->result()[i].score();
         EXPECT_EQ(0, std::memcmp(&expected[i].first, &actual, sizeof(float)));
+      }
+      if (borrowed) {
+        auto *scratch = static_cast<FlatStreamerContext<32> *>(context.get())
+                            ->search_scratch();
+#if defined(AILEGO_ARM64_NEON)
+        if (warmed) EXPECT_TRUE(scratch->vector_buffer.empty());
+#endif
+        scratch->vector_buffer.clear();
+        warmed = true;
       }
     }
     ASSERT_EQ(0, streamer->close());

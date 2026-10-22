@@ -175,6 +175,83 @@ TEST(NeonDistance, Fp16DotBatchPreservesScalarBits) {
 #endif
 }
 
+TEST(NeonDistance, Fp32SplitDotPreservesPointBits) {
+#if !defined(AILEGO_ARM64_NEON)
+  GTEST_SKIP() << "NEON distance kernels require AArch64";
+#else
+  const int rounding = std::fegetround();
+  auto restore = ailego::ScopeGuard::Make([&]() { std::fesetround(rounding); });
+  std::mt19937 generator(2087);
+  for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+    ASSERT_EQ(0, std::fesetround(mode));
+    for (size_t dim : {8U, 16U, 32U, 768U}) {
+      std::vector<float> query(dim + 1);
+      for (auto &value : query)
+        value = (static_cast<int>(generator() % 10001) - 5000) * .001f;
+      std::vector<std::vector<float>> rows(9, std::vector<float>(dim)),
+          first(9, std::vector<float>(dim + 2)),
+          second(9, std::vector<float>(dim + 1));
+      for (auto &row : rows)
+        for (auto &value : row)
+          value = (static_cast<int>(generator() % 10001) - 5000) * .001f;
+      rows[0][0] = -0.f;
+      rows[1][1] = std::numeric_limits<float>::infinity();
+      rows[2][2] = std::numeric_limits<float>::quiet_NaN();
+      const uint32_t signaling_nan = 0x7fa12345, negative_nan = 0xffc12345;
+      std::memcpy(&rows[3][3], &signaling_nan, sizeof(float));
+      std::memcpy(&rows[4][4], &negative_nan, sizeof(float));
+      std::fill(rows[5].begin(), rows[5].end(),
+                std::numeric_limits<float>::denorm_min());
+      std::fill(rows[6].begin(), rows[6].end(),
+                std::numeric_limits<float>::max() / 4);
+      std::vector<SplitVector> spans(9);
+      for (size_t prefix = 0; prefix <= dim; ++prefix) {
+        for (size_t row = 0; row < rows.size(); ++row) {
+          size_t cut = (prefix + row * 3) % (dim + 1);
+          std::fill(first[row].begin(), first[row].end(), 99.f);
+          std::copy_n(rows[row].data(), cut, first[row].data() + 1);
+          std::copy(rows[row].begin() + cut, rows[row].end(),
+                    second[row].begin() + 1);
+          spans[row] = {first[row].data() + 1, second[row].data() + 1,
+                        (cut == dim ? cut + 1 : cut) * sizeof(float)};
+        }
+        for (size_t count : {0U, 1U, 3U, 4U, 5U, 7U, 8U, 9U}) {
+          for (bool cosine : {false, true}) {
+            auto point = cosine ? neon::cosine_fp32_distance
+                                : neon::inner_product_fp32_distance;
+            auto split = cosine ? neon::cosine_fp32_split_batch_distance
+                                : neon::inner_product_fp32_split_batch_distance;
+            std::vector<float> expected(count + 1, 12345.f), actual = expected;
+            for (size_t row = 0; row < count; ++row)
+              point(rows[row].data(), query.data() + 1, dim, &expected[row]);
+            ASSERT_TRUE(split(spans.data(), count, query.data() + 1, dim,
+                              actual.data(), 0.f));
+            EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                                     actual.size() * sizeof(float)))
+                << "dim=" << dim << " prefix=" << prefix << " count=" << count;
+          }
+        }
+      }
+      SplitVector invalid[5];
+      std::fill_n(invalid, 5,
+                  SplitVector{rows[0].data(), nullptr, dim * sizeof(float)});
+      invalid[4].first_bytes = sizeof(float);
+      float untouched[5] = {12345.f, 12345.f, 12345.f, 12345.f, 12345.f};
+      EXPECT_FALSE(neon::inner_product_fp32_split_batch_distance(
+          invalid, 5, query.data(), dim, untouched, 0.f));
+      for (float value : untouched) EXPECT_EQ(12345.f, value);
+      invalid[4].second = rows[0].data();
+      invalid[4].first_bytes = 1;
+      EXPECT_FALSE(neon::cosine_fp32_split_batch_distance(
+          invalid, 5, query.data(), dim, untouched, 0.f));
+      EXPECT_FALSE(neon::cosine_fp32_split_batch_distance(
+          spans.data(), 5, query.data(), 7, untouched, 0.f));
+      for (float value : untouched) EXPECT_EQ(12345.f, value);
+    }
+  }
+#endif
+}
+
 TEST(NeonDistance, Fp32SplitPreservesScalarBits) {
   std::mt19937 generator(637);
   std::uniform_real_distribution<float> random(-3.f, 3.f);
