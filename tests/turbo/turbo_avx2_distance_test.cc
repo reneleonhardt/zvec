@@ -94,15 +94,16 @@ void CheckSplits(DataType type, QuantizeType quantize,
             const size_t batch =
                 arch == CpuArchType::kAVX512
                     ? (row + 1 < count ? 2 : 1)
-                    : (type == DataType::kFp32 && row + 4 <= count ? 4 : 1);
+                    : (type == DataType::kFp32 && row + 2 <= count ? 2 : 1);
             kernels.batch(pointers.data() + row, query.data(), batch, dim,
                           expected.data() + row, nullptr);
             row += batch;
           }
           kernels.batch(pointers.data(), query.data(), count, dim,
                         batched.data(), nullptr);
-          // Existing batch widths may choose different multiple-NaN payloads.
-          if (special != 3)
+          // AVX2 FP32 retains the original pair grouping, including NaN tails.
+          if (special != 3 ||
+              (arch == CpuArchType::kAVX2 && type == DataType::kFp32))
             ASSERT_EQ(0, std::memcmp(expected.data(), batched.data(),
                                      sizeof(expected)));
           expected = batched;
