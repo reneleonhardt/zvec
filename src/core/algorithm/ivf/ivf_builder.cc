@@ -785,9 +785,10 @@ int IVFBuilder::build_label_index(IndexThreads *threads,
   const size_t window_size =
       std::max<size_t>(1, kLabelMemoryBudget / elem_size);
   size_t window_count = 0;
+  const size_t batch_size = source_reader_ ? kSourceBatchSize : kBatchSize;
   std::shared_ptr<VectorList> vectors = std::make_shared<VectorList>();
   ivf_assert(vectors, IndexError_NoMemory);
-  vectors->reserve(std::min(kBatchSize, window_size));
+  vectors->reserve(std::min(batch_size, window_size));
   for (; iter && iter->is_valid(); iter->next()) {
     ivf_assert(!error_, err_code_);
     if (id >= holder->count() || id >= std::numeric_limits<uint32_t>::max()) {
@@ -803,14 +804,14 @@ int IVFBuilder::build_label_index(IndexThreads *threads,
     vectors->emplace_back(data, elem_size, id);
     id++;
     ++window_count;
-    if (vectors->size() == kBatchSize || window_count == window_size ||
+    if (vectors->size() == batch_size || window_count == window_size ||
         id == holder->count()) {
       auto task = ailego::Closure ::New(const_cast<IVFBuilder *>(this),
                                         &IVFBuilder::label, vectors);
       task_group->submit(std::move(task));
       vectors = std::make_shared<VectorList>();
       ivf_assert(vectors, IndexError_NoMemory);
-      vectors->reserve(std::min(kBatchSize, window_size));
+      vectors->reserve(std::min(batch_size, window_size));
     }
     if (window_count == window_size) {
       task_group->wait_finish();

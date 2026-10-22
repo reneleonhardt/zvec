@@ -262,6 +262,7 @@ class IVFBuilder : public IndexBuilder {
 
   //! Select the nearest centroid id for the vector
   void label(const std::shared_ptr<VectorList> &vecs) {
+    uint32_t centroid_ids[kSourceBatchSize];
     for (size_t i = 0; i < vecs->size(); ++i) {
       auto &vec = (*vecs)[i];
 
@@ -275,9 +276,19 @@ class IVFBuilder : public IndexBuilder {
         return;
       }
       ailego_assert_with(centroid_idx < labels_.size(), "Index Overflow");
-      mutex_.lock();
-      labels_[centroid_idx].emplace_back(vec.id());
-      mutex_.unlock();
+      if (source_reader_) {
+        centroid_ids[i] = centroid_idx;
+      } else {
+        std::lock_guard<std::mutex> lock(mutex_);
+        labels_[centroid_idx].emplace_back(vec.id());
+      }
+    }
+    if (source_reader_) {
+      // Source labels are sorted before dump, independent of worker completion.
+      std::lock_guard<std::mutex> lock(mutex_);
+      for (size_t i = 0; i < vecs->size(); ++i) {
+        labels_[centroid_ids[i]].emplace_back((*vecs)[i].id());
+      }
     }
   }
 
@@ -286,6 +297,7 @@ class IVFBuilder : public IndexBuilder {
   //! Constants
   static constexpr size_t kLabelMemoryBudget = 4u * 1024u * 1024u;
   static constexpr size_t kBatchSize = 10u;
+  static constexpr size_t kSourceBatchSize = 64u;
   static constexpr size_t kDefaultBlockCount = 32u;
 
   enum BuilderState { INIT = 0, INITED = 1, TRAINED = 2, BUILT = 3 };
