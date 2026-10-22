@@ -24,6 +24,9 @@
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
+#if defined(__APPLE__)
+#include <sys/uio.h>
+#endif
 
 #if defined(__linux__) && !defined(__ANDROID__)
 #include <ailego/io/io_backend_def.h>
@@ -505,6 +508,9 @@ bool VectorPageTable::wait_for_block_transition(block_id_t block_id) const {
 
     ++spin_count;
     if (spin_count < 64) {
+    } else if (state == kLoadingRefCount && spin_count < 8192) {
+      // Give an in-flight disk read time to finish without burning waiter CPU.
+      std::this_thread::sleep_for(std::chrono::microseconds(20));
     } else if (spin_count < 1024) {
       std::this_thread::yield();
     } else if (spin_count < 8192) {
@@ -2726,11 +2732,15 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
   if (count == 0) return true;
   if (page_ids == nullptr || priority > kHighPriority) return false;
 
-#if defined(__linux__) && !defined(__ANDROID__)
+#if (defined(__linux__) && !defined(__ANDROID__)) || defined(__APPLE__)
+#if defined(__linux__)
   if (!aio_enabled_) return false;
   bool use_io_uring = io_backend_type_ == IOBackendType::kIoUring &&
                       tl_blocking_io_uring.ensure();
   if (!use_io_uring && !tl_blocking_aio.ensure()) return false;
+#else
+  if (writable_) return false;
+#endif
 
   size_t cursor = 0;
   while (cursor < count) {
@@ -2771,6 +2781,9 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
       }
     }
     if (load_count == 0) continue;
+#if defined(__APPLE__)
+    std::sort(load_pages.begin(), load_pages.begin() + load_count);
+#endif
 
     std::array<char *, kBlockingAioBatchSize> buffers{};
     size_t allocated = MemoryLimitPool::get_instance().batch_acquire_buffers(
@@ -2803,7 +2816,8 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
     }
     if (allocated == 0) return false;
 
-    auto abandon_claims = [&](size_t abandon_count, bool release_buffers) {
+    [[maybe_unused]] auto abandon_claims = [&](size_t abandon_count,
+                                               bool release_buffers) {
       for (size_t i = 0; i < abandon_count; ++i) {
         if (buffers[i]) {
           if (release_buffers) {
@@ -2822,6 +2836,52 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
     };
 
     std::array<bool, kBlockingAioBatchSize> read_ok{};
+#if defined(__APPLE__)
+    // Coalesce consecutive claims directly into their cache frames.
+    for (size_t begin = 0; begin < allocated;) {
+      size_t end = begin + 1;
+      while (end < allocated && load_pages[end] == load_pages[end - 1] + 1)
+        ++end;
+      std::array<iovec, kBlockingAioBatchSize> vectors;
+      for (size_t i = begin; i < end; ++i) {
+        const size_t expected = std::min(
+            kVectorPageSize, file_size_ - load_pages[i] * kVectorPageSize);
+        vectors[i - begin] = {buffers[i], expected};
+        if (expected < kVectorPageSize)
+          std::memset(buffers[i] + expected, 0, kVectorPageSize - expected);
+      }
+      size_t read_index = 0;
+      size_t offset = load_pages[begin] * kVectorPageSize;
+      while (read_index < end - begin) {
+        if (vectors[read_index].iov_len == 0) {
+          ++read_index;
+          continue;
+        }
+        ssize_t result;
+        if (__builtin_available(macOS 11.0, *))
+          result = ::preadv(fd_, vectors.data() + read_index,
+                            static_cast<int>(end - begin - read_index), offset);
+        else
+          result = zvec_pread(fd_, vectors[read_index].iov_base,
+                              vectors[read_index].iov_len, offset);
+        if (result < 0 && errno == EINTR) continue;
+        if (result <= 0) break;
+        offset += result;
+        size_t remaining = static_cast<size_t>(result);
+        while (remaining != 0) {
+          const size_t consumed = std::min(remaining, vectors[read_index].iov_len);
+          vectors[read_index].iov_base =
+              static_cast<char *>(vectors[read_index].iov_base) + consumed;
+          vectors[read_index].iov_len -= consumed;
+          remaining -= consumed;
+          if (vectors[read_index].iov_len == 0) ++read_index;
+        }
+      }
+      if (read_index == end - begin)
+        std::fill(read_ok.begin() + begin, read_ok.begin() + end, true);
+      begin = end;
+    }
+#else
     if (use_io_uring) {
       std::array<IoUringRead, kBlockingAioBatchSize> requests{};
       for (size_t i = 0; i < allocated; ++i) {
@@ -2929,6 +2989,7 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
       }
     }
 
+#endif
     for (size_t i = 0; i < allocated; ++i) {
       if (buffers[i] == nullptr) continue;
       if (!read_ok[i]) {

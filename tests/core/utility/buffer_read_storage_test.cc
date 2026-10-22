@@ -122,14 +122,23 @@ TEST_F(BufferReadStorageTest, ResidentScatterReadReturnsPinnedPageSpans) {
   EXPECT_EQ(length, block.size);
   EXPECT_EQ(IndexStorage::MemoryBlock::MBT_UNKNOWN, block.fallback.type_);
   ASSERT_NE(nullptr, block.lease);
+  std::weak_ptr<void> lease = block.lease;
+  auto retained = std::move(block);
+  auto shared_lease = retained.lease;
+  block.reset();
+  EXPECT_FALSE(lease.expired());
 
   std::string actual;
   actual.reserve(length);
-  for (const auto &span : block.spans) {
+  for (const auto &span : retained.spans) {
     actual.append(reinterpret_cast<const char *>(span.data), span.size);
   }
   ASSERT_EQ(length, actual.size());
   EXPECT_EQ(0, std::memcmp(payload_.data() + offset, actual.data(), length));
+  retained.reset();
+  EXPECT_FALSE(lease.expired());
+  shared_lease.reset();
+  EXPECT_TRUE(lease.expired());
 }
 
 TEST_F(BufferReadStorageTest, ColdScatterReadKeepsContiguousFallback) {

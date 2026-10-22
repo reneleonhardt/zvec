@@ -42,7 +42,7 @@ namespace {
 
 // Create a backing file of `num_pages` pages, page p filled with byte (p &
 // 0xff) so page content can be verified after arbitrary eviction/reload.
-std::string MakeBackingFile(size_t num_pages) {
+std::string MakeBackingFile(size_t num_pages, size_t tail = kVectorPageSize) {
   static std::atomic<uint64_t> seq{0};
   const size_t ps = kVectorPageSize;
   std::string path = "vpt_test_" + std::to_string(seq.fetch_add(1)) + ".bin";
@@ -52,7 +52,8 @@ std::string MakeBackingFile(size_t num_pages) {
   std::vector<char> page(ps);
   for (size_t p = 0; p < num_pages; ++p) {
     std::memset(page.data(), static_cast<int>(p & 0xff), ps);
-    EXPECT_EQ(std::fwrite(page.data(), 1, ps, f), ps);
+    const size_t bytes = p + 1 == num_pages ? tail : ps;
+    EXPECT_EQ(std::fwrite(page.data(), 1, bytes, f), bytes);
   }
   std::fclose(f);
   return path;
@@ -98,8 +99,8 @@ class BufferPoolTest : public ::testing::Test {
     for (const auto &p : files_) std::remove(p.c_str());
     files_.clear();
   }
-  std::string new_file(size_t num_pages) {
-    files_.push_back(MakeBackingFile(num_pages));
+  std::string new_file(size_t num_pages, size_t tail = kVectorPageSize) {
+    files_.push_back(MakeBackingFile(num_pages, tail));
     return files_.back();
   }
   std::vector<std::string> files_;
@@ -1911,20 +1912,25 @@ TEST_F(BufferPoolTest, AioAdmissionUsesFreeCapacityBeforeEviction) {
 // pin for every occurrence of a duplicate page id.
 TEST_F(BufferPoolTest, BatchAcquireScatteredPagesWithDuplicates) {
   init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/32);
-  std::string file = new_file(/*num_pages=*/32);
+  std::string file = new_file(/*num_pages=*/32, /*tail=*/17);
 
   VecBufferPool pool(file, /*writable=*/false);
   ASSERT_EQ(pool.init(), 0);
   auto handle = pool.get_handle();
 
-  const block_id_t page_ids[] = {7, 1, 7, 31, 0, 16};
+  const block_id_t page_ids[] = {7, 1, 7, 31, 0, 16, 2, 3, 4};
   char *pages[sizeof(page_ids) / sizeof(page_ids[0])] = {};
   constexpr size_t count = sizeof(page_ids) / sizeof(page_ids[0]);
 
   ASSERT_TRUE(handle.acquire_pages(page_ids, count, pages));
   for (size_t i = 0; i < count; ++i) {
     ASSERT_NE(pages[i], nullptr);
-    ExpectPageContent(pages[i], page_ids[i]);
+    if (page_ids[i] == 31) {
+      for (size_t j = 0; j < kVectorPageSize; ++j)
+        ASSERT_EQ(j < 17 ? 31 : 0, pages[i][j]);
+    } else {
+      ExpectPageContent(pages[i], page_ids[i]);
+    }
   }
   EXPECT_EQ(pages[0], pages[2]);
 
@@ -2034,6 +2040,16 @@ TEST_F(BufferPoolTest, BatchAcquireRollsBackPinsOnInvalidPage) {
   EXPECT_EQ(pages[0], nullptr);
   EXPECT_EQ(pages[1], nullptr);
   EXPECT_TRUE(pool.page_table_.is_released(1));
+  FILE *truncated = std::fopen(file.c_str(), "wb");
+  ASSERT_NE(nullptr, truncated);
+  ASSERT_NE(EOF, std::fputc(99, truncated));
+  ASSERT_EQ(0, std::fclose(truncated));
+  const block_id_t valid_ids[] = {0, 1};
+  EXPECT_FALSE(handle.acquire_pages(valid_ids, 2, pages));
+  for (size_t i = 0; i < 2; ++i) {
+    EXPECT_EQ(nullptr, pages[i]);
+    EXPECT_FALSE(pool.page_table_.has_residency_activity(valid_ids[i]));
+  }
 }
 
 // ---------------------------------------------------------------------------

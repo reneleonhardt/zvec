@@ -61,8 +61,8 @@ bool ResolveContainerOffset(size_t file_size, int64_t configured_offset,
 class BufferPageLease {
  public:
   BufferPageLease(std::shared_ptr<ailego::VecBufferPoolHandle> handle,
-                  const std::vector<ailego::block_id_t> &page_ids)
-      : handle_(std::move(handle)), page_ids_(page_ids) {}
+                  std::vector<ailego::block_id_t> page_ids) noexcept
+      : handle_(std::move(handle)), page_ids_(std::move(page_ids)) {}
 
   BufferPageLease(const BufferPageLease &) = delete;
   BufferPageLease &operator=(const BufferPageLease &) = delete;
@@ -227,7 +227,8 @@ class BufferReadStorage : public IndexStorage {
                                (span_begin - page_begin),
                            span_end - span_begin});
         }
-        auto lease = std::make_shared<BufferPageLease>(handle_, page_ids);
+        auto lease =
+            std::make_shared<BufferPageLease>(handle_, std::move(page_ids));
         pins_owned_by_lease = true;
         data.reset_scattered(std::move(spans), std::move(lease), len);
         return len;
