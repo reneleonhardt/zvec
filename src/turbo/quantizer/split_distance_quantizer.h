@@ -27,10 +27,11 @@ struct SplitVector {
 //! Optional distance kernel for codes split across pinned pages.
 class SplitDistanceQuantizer {
  public:
-  //! The second span starts at first_bytes in each original code. Return false
-  //! without touching distances when any split cannot preserve ordinary scores.
-  //! Scores below cutoff remain exact; proven losers may be marked infinite.
-  //! A nonfinite cutoff requests every ordinary distance without pruning.
+  //! The second span starts at first_bytes in each original code. On false,
+  //! callers must discard all distances and recompute through the ordinary
+  //! path. Scores below cutoff remain exact; proven losers may be marked
+  //! infinite. A nonfinite cutoff requests every ordinary distance without
+  //! pruning.
   using Distance = bool (*)(const SplitVector *vectors, size_t count,
                             const void *query, size_t dim, float *distances,
                             float cutoff);

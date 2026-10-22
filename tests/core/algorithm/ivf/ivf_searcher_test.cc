@@ -23,6 +23,7 @@
 #include <vector>
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
+#include <turbo/quantizer/fp32_quantizer/fp32_quantizer.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/core/framework/index_segment_storage.h>
@@ -4457,8 +4458,28 @@ TEST(IVFScatter, ExactFp32PageFragments) {
     ailego::File::RemovePath(path);
     EXPECT_EQ(0, pool.init(capacity));
   });
+  class RejectingQuantizer : public turbo::Fp32Quantizer {
+   public:
+    turbo::SplitDistanceQuantizer::Distance split_distance() const override {
+      if (!reject) return nullptr;
+      return [](const turbo::SplitVector *, size_t count, const void *, size_t,
+                float *scores, float) {
+        ++calls();
+        std::fill_n(scores, count, -1e6f);
+        return false;
+      };
+    }
+    static size_t &calls() {
+      static size_t count = 0;
+      return count;
+    }
+    bool reject{false};
+  };
   class Entity : public IVFEntity {
    public:
+    void set_quantizer(const turbo::Quantizer::Pointer &quantizer) {
+      quantizer_ = quantizer;
+    }
     void poison(size_t bytes) {
       scatter_vector_.assign(bytes, 0x99);
     }
@@ -4535,6 +4556,44 @@ TEST(IVFScatter, ExactFp32PageFragments) {
 #if defined(AILEGO_ARM64_NEON)
           EXPECT_TRUE(entity.untouched());
 #endif
+        }
+      }
+      auto rejecting = std::make_shared<RejectingQuantizer>();
+      ASSERT_EQ(0, rejecting->init(raw, ailego::Params()));
+      entity.set_quantizer(rejecting);
+      ASSERT_EQ(0, entity.bind_query(query.data(), qmeta));
+      for (bool filtered : {false, true}) {
+        IndexFilter filter;
+        if (filtered) filter.set([](uint64_t key) { return key % 2 == 0; });
+        std::vector<std::pair<uint64_t, uint32_t>> reference;
+        for (bool reject : {false, true}) {
+          rejecting->reject = reject;
+          for (int repeat = 0; repeat < 2; ++repeat) {
+            IndexDocumentHeap heap(11);
+            IndexContext::Stats counters;
+            uint32_t scanned = 0;
+            RejectingQuantizer::calls() = 0;
+            ASSERT_EQ(0, filtered ? entity.search(0, query.data(), filter,
+                                                  &scanned, &heap, &counters)
+                                  : entity.search(0, query.data(), &scanned,
+                                                  &heap, &counters));
+            EXPECT_EQ(count, scanned);
+            if (reject && std::string(backend) == "BufferReadStorage")
+              EXPECT_GT(RejectingQuantizer::calls(), 0U);
+            heap.sort();
+            ASSERT_EQ(11U, heap.size());
+            std::vector<std::pair<uint64_t, uint32_t>> actual;
+            for (size_t i = 0; i < heap.size(); ++i) {
+              const float score = heap[i].score();
+              uint32_t bits;
+              std::memcpy(&bits, &score, sizeof(bits));
+              actual.emplace_back(heap[i].key(), bits);
+            }
+            if (!reject)
+              reference = actual;
+            else
+              EXPECT_EQ(reference, actual);
+          }
         }
       }
       ASSERT_EQ(0, storage->close());

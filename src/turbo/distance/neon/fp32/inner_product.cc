@@ -14,6 +14,7 @@
 
 #include "neon/fp32/inner_product.h"
 #include <algorithm>
+#include <cstdint>
 #include <cstring>
 #include <type_traits>
 #include <zvec/ailego/internal/platform.h>
@@ -90,8 +91,13 @@ void inner_product_fp32_batch_distance(const void *const *vectors,
     for (; d < dim; ++d)
       for (size_t row = 0; row < 4; ++row)
         totals[row] += rows[row][d] * q[d];
-    for (size_t row = 0; row < 4; ++row)
+    for (size_t row = 0; row < 4; ++row) {
       distances[i + row] = -totals[row];
+      uint32_t bits;
+      std::memcpy(&bits, &distances[i + row], sizeof(bits));
+      if ((bits & 0x7fffffffU) > 0x7f800000U)
+        inner_product_fp32_distance(rows[row], query, dim, distances + i + row);
+    }
   }
 #endif
   for (; i < n; ++i) {
@@ -107,6 +113,7 @@ bool inner_product_fp32_split_batch_distance(const SplitVector *vectors,
   if (dim % 8) return false;
   for (size_t i = 0; i < count; ++i)
     if (vectors[i].first_bytes % sizeof(float) ||
+        (vectors[i].first_bytes && !vectors[i].first) ||
         (vectors[i].first_bytes / sizeof(float) < dim && !vectors[i].second))
       return false;
   const auto *q = static_cast<const float *>(query);
@@ -161,13 +168,19 @@ bool inner_product_fp32_split_batch_distance(const SplitVector *vectors,
       }
       d += 8;
     }
-    for (size_t row = 0; row < rows; ++row)
+    for (size_t row = 0; row < rows; ++row) {
       distances[first + row] = -vaddvq_f32(vaddq_f32(sum0[row], sum1[row]));
+      uint32_t bits;
+      std::memcpy(&bits, &distances[first + row], sizeof(bits));
+      if ((bits & 0x7fffffffU) > 0x7f800000U) return false;
+    }
+    return true;
   };
   size_t i = 0;
   for (; count - i >= 4; i += 4)
-    compute(std::integral_constant<size_t, 4>{}, i);
-  for (; i < count; ++i) compute(std::integral_constant<size_t, 1>{}, i);
+    if (!compute(std::integral_constant<size_t, 4>{}, i)) return false;
+  for (; i < count; ++i)
+    if (!compute(std::integral_constant<size_t, 1>{}, i)) return false;
   return true;
 #else
   (void)vectors;

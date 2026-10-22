@@ -47,9 +47,7 @@ void CheckSplits(DataType type, QuantizeType quantize,
       for (auto &value : finite_query)
         value = static_cast<T>(random(generator));
       for (auto &value : finite_rows) value = static_cast<T>(random(generator));
-      // Multi-NaN payloads use the frozen whole-symbol oracle in exact_bits.py;
-      // existing kernel widths can select different payloads.
-      for (int special : {0, 1, 2}) {
+      for (int special : {0, 1, 2, 3}) {
         auto query = finite_query;
         auto rows = finite_rows;
         if (special == 1 || special == 2) {
@@ -62,6 +60,14 @@ void CheckSplits(DataType type, QuantizeType quantize,
             std::memcpy(static_cast<void *>(query.data()), &qnan, sizeof(T));
             std::memcpy(static_cast<void *>(rows.data()), &dnan, sizeof(T));
           }
+        }
+        if (special == 3) {
+          for (size_t row = 0; row < count; ++row)
+            for (size_t d = 0; d < dim; d += 7) {
+              const uint64_t nan = (sizeof(T) == 4 ? 0x7fc00000 : 0x7e00) |
+                                   (1 + (row * 17 + d) % 511);
+              std::memcpy(rows.data() + row * dim + d, &nan, sizeof(T));
+            }
         }
         size_t metric_index = 0;
         for (auto metric : metrics) {
@@ -95,8 +101,11 @@ void CheckSplits(DataType type, QuantizeType quantize,
           }
           kernels.batch(pointers.data(), query.data(), count, dim,
                         batched.data(), nullptr);
-          ASSERT_EQ(0, std::memcmp(expected.data(), batched.data(),
-                                   sizeof(expected)));
+          // Existing batch widths may choose different multiple-NaN payloads.
+          if (special != 3)
+            ASSERT_EQ(0, std::memcmp(expected.data(), batched.data(),
+                                     sizeof(expected)));
+          expected = batched;
           const size_t alignment =
               arch == CpuArchType::kAVX2
                   ? 8
@@ -117,24 +126,33 @@ void CheckSplits(DataType type, QuantizeType quantize,
               }
               vectors[row] = {source, second, cut * sizeof(T)};
             }
-            ASSERT_TRUE(splits[metric_index](vectors.data(), count,
-                                             query.data(), dim, actual.data(),
-                                             INFINITY));
+            const bool accepted =
+                splits[metric_index](vectors.data(), count, query.data(), dim,
+                                     actual.data(), INFINITY);
+            ASSERT_EQ(special == 0, accepted);
+            if (!accepted)
+              kernels.batch(pointers.data(), query.data(), count, dim,
+                            actual.data(), nullptr);
             ASSERT_EQ(0, std::memcmp(expected.data(), actual.data(),
                                      sizeof(expected)))
                 << "dim=" << dim << " cut=" << cut
                 << " metric=" << metric_index;
             if (metric_index == 0) {
               for (float cutoff : {expected[4], .01f}) {
-                ASSERT_TRUE(splits[0](vectors.data(), count, query.data(), dim,
-                                      actual.data(), cutoff));
+                const bool bounded =
+                    splits[0](vectors.data(), count, query.data(), dim,
+                              actual.data(), cutoff);
+                ASSERT_EQ(special == 0, bounded);
+                if (!bounded)
+                  kernels.batch(pointers.data(), query.data(), count, dim,
+                                actual.data(), nullptr);
                 for (size_t row = 0; row < count; ++row) {
                   if (!(std::isinf(actual[row]) && expected[row] >= cutoff)) {
                     ASSERT_EQ(0, std::memcmp(&expected[row], &actual[row],
                                              sizeof(float)));
                   }
                 }
-                if (cutoff == .01f && dim > 64 && special < 2 && count >= 8) {
+                if (bounded && cutoff == .01f && dim > 64 && count >= 8) {
                   EXPECT_TRUE(std::isinf(actual[4]));
                 }
               }

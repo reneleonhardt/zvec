@@ -15,6 +15,8 @@
 #include "neon_fp16/fp16/squared_euclidean.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include "common/fp16_common.h"
 #if ZVEC_TURBO_FP16_NEON
@@ -36,7 +38,10 @@ bool split_batch_distance(const SplitVector *vectors, size_t count,
   if (dim % 16) return false;
   for (size_t i = 0; i < count; ++i)
     if (vectors[i].first_bytes % (16 * sizeof(float16_t)) ||
-        vectors[i].first_bytes / sizeof(float16_t) > dim)
+        vectors[i].first_bytes / sizeof(float16_t) > dim ||
+        (vectors[i].first_bytes && !vectors[i].first) ||
+        (vectors[i].first_bytes / sizeof(float16_t) < dim &&
+         !vectors[i].second))
       return false;
   const auto *q = static_cast<const float16_t *>(query);
   using Accumulator = detail::Fp32DistanceAccumulator<true>;
@@ -85,8 +90,9 @@ bool split_batch_distance(const SplitVector *vectors, size_t count,
             // For long rows, recompute the winner with the ordinary reduction.
             const size_t row = __builtin_ctz(survivors);
             float distance;
-            split_batch_distance<false>(vectors + i + row, 1, query, dim,
-                                        &distance, 0);
+            if (!split_batch_distance<false>(vectors + i + row, 1, query, dim,
+                                             &distance, 0))
+              return false;
             for (size_t r = 0; r < 4; ++r)
               distances[i + r] = std::numeric_limits<float>::infinity();
             distances[i + row] = distance;
@@ -97,14 +103,20 @@ bool split_batch_distance(const SplitVector *vectors, size_t count,
       }
     }
     if (!single_survivor)
-      for (size_t row = 0; row < 4; ++row)
+      for (size_t row = 0; row < 4; ++row) {
         distances[i + row] = rejected ? std::numeric_limits<float>::infinity()
                                       : sums[row].reduce();
+        uint32_t bits;
+        std::memcpy(&bits, &distances[i + row], sizeof(bits));
+        if ((bits & 0x7fffffffU) > 0x7f800000U) return false;
+      }
     i += 4;
     if constexpr (Bounded) {
       if (!rejected && !single_survivor) {
         const size_t rest = std::min(count - i, (32 - i % 32) % 32);
-        split_batch_distance<false>(vectors + i, rest, query, dim, distances + i, 0);
+        if (!split_batch_distance<false>(vectors + i, rest, query, dim,
+                                         distances + i, 0))
+          return false;
         i += rest;
       }
     }
@@ -125,6 +137,9 @@ bool split_batch_distance(const SplitVector *vectors, size_t count,
     accumulate(vectors[i].first, first);
     accumulate(vectors[i].second, dim - first);
     distances[i] = sum.reduce();
+    uint32_t bits;
+    std::memcpy(&bits, &distances[i], sizeof(bits));
+    if ((bits & 0x7fffffffU) > 0x7f800000U) return false;
   }
   return true;
 }

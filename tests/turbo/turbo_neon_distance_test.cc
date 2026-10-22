@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#include <algorithm>
 #include <array>
 #include <cfenv>
 #include <cmath>
@@ -31,9 +32,9 @@
 #include "distance/neon/fp32/cosine.h"
 #include "distance/neon/fp32/inner_product.h"
 #include "distance/neon/fp32/squared_euclidean.h"
-#include "distance/neon_fp16/fp16/squared_euclidean.h"
 #include "distance/neon/record_quantized_int4/common.h"
 #include "distance/neon/record_quantized_int8/common.h"
+#include "distance/neon_fp16/fp16/squared_euclidean.h"
 #include "distance/scalar/fp16/cosine.h"
 #include "distance/scalar/fp16/inner_product.h"
 #include "distance/scalar/fp16/squared_euclidean.h"
@@ -58,6 +59,16 @@ using RawDistanceFn = void (*)(const void *, const void *, size_t, float *);
   expected_fn(a, b, dim, &expected);
   actual_fn(a, b, dim, &actual);
   EXPECT_NEAR(expected, actual, tolerance) << "dim=" << dim;
+}
+
+template <typename T>
+void add_nan_payloads(std::vector<T> &values, size_t offset = 0) {
+  using Bits = std::conditional_t<sizeof(T) == 4, uint32_t, uint16_t>;
+  for (size_t d = offset; d < values.size(); d += 7) {
+    const Bits bits = (sizeof(T) == 4 ? 0x7fc00000U : 0x7e00U) | (1 + d % 511) |
+                      ((d & 1) ? (sizeof(T) == 4 ? 0x80000000U : 0x8000U) : 0);
+    std::memcpy(&values[d], &bits, sizeof(T));
+  }
 }
 
 TEST(NeonDistance, Fp32MatchesScalarForRemainders) {
@@ -112,6 +123,7 @@ TEST(NeonDistance, Fp32BatchPreservesScalarBits) {
       rows[1][3] = -0.f;
       rows[2][2] = std::numeric_limits<float>::infinity();
       rows[3][1] = std::numeric_limits<float>::quiet_NaN();
+      for (size_t row : {4U, 7U, 8U}) add_nan_payloads(rows[row], 1);
       for (size_t dim : {0U, 1U, 7U, 8U, 9U, 16U, 17U, 31U, 32U, 768U, 769U}) {
         for (size_t count : {0U, 1U, 3U, 4U, 5U, 7U, 8U, 9U}) {
           std::vector<float> expected(count + 1, 12345.f), actual = expected;
@@ -147,6 +159,7 @@ TEST(NeonDistance, Fp16DotBatchPreservesScalarBits) {
       value = (generator() % 0x7c00) | (generator() & 0x8000);
     pointers.push_back(row.data() + 1);
   }
+  for (size_t row : {4U, 7U, 8U}) add_nan_payloads(rows[row], 1);
   for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
     ASSERT_EQ(0, std::fesetround(mode));
     for (uint16_t special : {0U, 0x8000U, 0x7c00U, 0x7e11U, 0x7c01U}) {
@@ -204,6 +217,7 @@ TEST(NeonDistance, Fp32SplitDotPreservesPointBits) {
                 std::numeric_limits<float>::denorm_min());
       std::fill(rows[6].begin(), rows[6].end(),
                 std::numeric_limits<float>::max() / 4);
+      for (size_t row : {7U, 8U}) add_nan_payloads(rows[row]);
       std::vector<SplitVector> spans(9);
       for (size_t boundary = 0; boundary < 2 * (dim + 1); ++boundary) {
         const size_t prefix = boundary % (dim + 1);
@@ -229,8 +243,15 @@ TEST(NeonDistance, Fp32SplitDotPreservesPointBits) {
             std::vector<float> expected(count + 1, 12345.f), actual = expected;
             for (size_t row = 0; row < count; ++row)
               point(rows[row].data(), query.data() + 1, dim, &expected[row]);
-            ASSERT_TRUE(split(spans.data(), count, query.data() + 1, dim,
-                              actual.data(), 0.f));
+            const bool has_nan =
+                std::any_of(expected.begin(), expected.begin() + count,
+                            [](float v) { return std::isnan(v); });
+            const bool accepted = split(spans.data(), count, query.data() + 1,
+                                        dim, actual.data(), 0.f);
+            EXPECT_EQ(!has_nan, accepted);
+            if (!accepted)
+              for (size_t row = 0; row < count; ++row)
+                point(rows[row].data(), query.data() + 1, dim, &actual[row]);
             EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
                                      actual.size() * sizeof(float)))
                 << "dim=" << dim << " prefix=" << prefix << " count=" << count;
@@ -246,6 +267,13 @@ TEST(NeonDistance, Fp32SplitDotPreservesPointBits) {
           invalid, 5, query.data(), dim, untouched, 0.f));
       for (float value : untouched) EXPECT_EQ(12345.f, value);
       invalid[4].second = rows[0].data();
+      invalid[4].first = nullptr;
+      for (auto split : {neon::inner_product_fp32_split_batch_distance,
+                         neon::cosine_fp32_split_batch_distance}) {
+        EXPECT_FALSE(split(invalid, 5, query.data(), dim, untouched, 0.f));
+        for (float value : untouched) EXPECT_EQ(12345.f, value);
+      }
+      invalid[4].first = rows[0].data();
       invalid[4].first_bytes = 1;
       EXPECT_FALSE(neon::cosine_fp32_split_batch_distance(
           invalid, 5, query.data(), dim, untouched, 0.f));
@@ -266,6 +294,7 @@ TEST(NeonDistance, Fp32SplitPreservesScalarBits) {
     for (auto &row : rows)
       for (auto &v : row) v = random(generator);
     for (auto &v : query) v = random(generator);
+    for (size_t row : {4U, 7U, 8U}) add_nan_payloads(rows[row], 1);
     for (size_t prefix = 0; prefix <= dim; prefix += 4) {
       std::vector<std::vector<float>> first(9), second(9);
       std::vector<SplitVector> vectors;
@@ -286,10 +315,18 @@ TEST(NeonDistance, Fp32SplitPreservesScalarBits) {
           for (size_t i = 0; i < count; ++i)
             neon::squared_euclidean_fp32_distance(
                 rows[i].data() + 1, query.data() + 1, dim, &expected[i]);
-        EXPECT_EQ(supported,
-                  neon::squared_euclidean_fp32_bounded_split_batch_distance(
-                      vectors.data(), count, query.data() + 1, dim, actual.data(),
-                      std::numeric_limits<float>::infinity()));
+        const bool has_nan =
+            std::any_of(expected.begin(), expected.begin() + count,
+                        [](float v) { return std::isnan(v); });
+        const bool accepted =
+            neon::squared_euclidean_fp32_bounded_split_batch_distance(
+                vectors.data(), count, query.data() + 1, dim, actual.data(),
+                std::numeric_limits<float>::infinity());
+        EXPECT_EQ(supported && !has_nan, accepted);
+        if (supported && !accepted)
+          for (size_t i = 0; i < count; ++i)
+            neon::squared_euclidean_fp32_distance(
+                rows[i].data() + 1, query.data() + 1, dim, &actual[i]);
         EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
                                 actual.size() * sizeof(float)))
             << "dim=" << dim << " prefix=" << prefix << " count=" << count;
@@ -311,6 +348,17 @@ template <typename T>
 void check_bounded_distances(
     size_t stride, SplitDistanceQuantizer::Distance bounded,
     void (*ordinary)(const void *, const void *, size_t, float *)) {
+  std::vector<T> data(2 * stride);
+  SplitVector invalid[5];
+  std::fill_n(invalid, 5,
+              SplitVector{data.data(), nullptr, data.size() * sizeof(T)});
+  for (bool missing_first : {true, false}) {
+    invalid[4] = {missing_first ? nullptr : data.data(),
+                  missing_first ? data.data() : nullptr, stride * sizeof(T)};
+    float untouched[5] = {12345.f, 12345.f, 12345.f, 12345.f, 12345.f};
+    EXPECT_FALSE(bounded(invalid, 5, data.data(), data.size(), untouched, 0.f));
+    for (float value : untouched) EXPECT_EQ(12345.f, value);
+  }
   auto encode = [](float value) {
     if constexpr (std::is_same_v<T, float>) return value;
     else {
@@ -319,48 +367,73 @@ void check_bounded_distances(
       return half;
     }
   };
-  for (size_t dim : {stride, size_t(64), 64 + stride, size_t(128), size_t(256), size_t(768)}) {
-    std::vector<T> query(dim, encode(.25f));
-    std::vector<std::vector<T>> rows(49, std::vector<T>(dim, encode(2.f)));
-    rows[4] = query;
-    rows[5] = query;
-    rows[5].back() = encode(.2501f);
-    rows[2].back() = encode(std::numeric_limits<float>::quiet_NaN());
-    rows[3].back() = encode(std::numeric_limits<float>::infinity());
-    for (size_t row : {32U, 37U, 42U, 47U}) rows[row] = query;
-    rows[37].back() = encode(.273f);
-    rows[42].back() = encode(std::numeric_limits<float>::quiet_NaN());
-    for (size_t d = 0; d < dim; ++d)
-      rows[47][d] = encode(.25f + .005f * (int(d % 7) - 3));
-    std::vector<SplitVector> views;
-    std::vector<float> expected(rows.size());
-    for (size_t i = 0; i < rows.size(); ++i) {
-      const size_t prefix = (i * stride) % (dim + stride);
-      views.push_back({rows[i].data(), rows[i].data() + prefix,
-                        prefix * sizeof(T)});
-      ordinary(rows[i].data(), query.data(), dim, &expected[i]);
-    }
-    for (float cutoff : {0.f, .00001f, 1.f, -1.f,
-                         std::numeric_limits<float>::max(),
-                         std::numeric_limits<float>::infinity(),
-                         std::numeric_limits<float>::quiet_NaN()}) {
-      for (size_t count : {0U, 1U, 3U, 4U, 5U, 8U, 9U, 32U, 33U, 37U, 41U, 49U}) {
-        std::vector<float> actual(count + 1, 12345.f);
-        ASSERT_TRUE(bounded(
-            views.data(), count, query.data(), dim, actual.data(), cutoff));
-        for (size_t i = 0; i < count; ++i) {
-          if (!std::isfinite(cutoff) || expected[i] < cutoff)
-            EXPECT_EQ(0, std::memcmp(&expected[i], &actual[i], sizeof(float)));
-          else
-            EXPECT_TRUE(std::isnan(actual[i]) || actual[i] >= cutoff);
+  for (bool exceptional : {false, true})
+    for (size_t dim : {stride, size_t(64), 64 + stride, size_t(128),
+                       size_t(256), size_t(768)}) {
+      std::vector<T> query(dim, encode(.25f));
+      std::vector<std::vector<T>> rows(49, std::vector<T>(dim, encode(2.f)));
+      rows[4] = query;
+      rows[5] = query;
+      rows[5].back() = encode(.2501f);
+      if (exceptional)
+        rows[2].back() = encode(std::numeric_limits<float>::quiet_NaN());
+      rows[3].back() = encode(std::numeric_limits<float>::infinity());
+      for (size_t row : {32U, 37U, 42U, 47U}) rows[row] = query;
+      rows[37].back() = encode(.273f);
+      if (exceptional)
+        for (size_t row : {7U, 8U, 42U}) add_nan_payloads(rows[row]);
+      for (size_t d = 0; d < dim; ++d)
+        rows[47][d] = encode(.25f + .005f * (int(d % 7) - 3));
+      std::vector<SplitVector> views;
+      std::vector<float> expected(rows.size());
+      for (size_t i = 0; i < rows.size(); ++i) {
+        const size_t prefix = (i * stride) % (dim + stride);
+        views.push_back(
+            {rows[i].data(), rows[i].data() + prefix, prefix * sizeof(T)});
+        ordinary(rows[i].data(), query.data(), dim, &expected[i]);
+      }
+      for (float cutoff :
+           {0.f, .00001f, 1.f, -1.f, std::numeric_limits<float>::max(),
+            std::numeric_limits<float>::infinity(),
+            std::numeric_limits<float>::quiet_NaN()}) {
+        for (size_t count :
+             {0U, 1U, 3U, 4U, 5U, 8U, 9U, 32U, 33U, 37U, 41U, 49U}) {
+          std::vector<float> actual(count + 1, 12345.f);
+          const bool accepted = bounded(views.data(), count, query.data(), dim,
+                                        actual.data(), cutoff);
+          if (!accepted) {
+            ASSERT_TRUE(std::any_of(expected.begin(), expected.begin() + count,
+                                    [](float v) { return std::isnan(v); }));
+            for (size_t i = 0; i < count; ++i)
+              ordinary(rows[i].data(), query.data(), dim, &actual[i]);
+          }
+          for (size_t i = 0; i < count; ++i) {
+            if (!accepted || !std::isfinite(cutoff) || expected[i] < cutoff)
+              EXPECT_EQ(0,
+                        std::memcmp(&expected[i], &actual[i], sizeof(float)));
+            else
+              EXPECT_TRUE(std::isnan(actual[i]) || actual[i] >= cutoff);
+          }
+          EXPECT_EQ(12345.f, actual[count]);
+          if (accepted && count >= 4 && dim > 64 && cutoff == 1.f)
+            EXPECT_EQ(std::numeric_limits<float>::infinity(), actual[0]);
+          if (accepted && count >= 37 && dim >= 256 && cutoff == 1.f)
+            EXPECT_EQ(std::numeric_limits<float>::infinity(), actual[33]);
         }
-        EXPECT_EQ(12345.f, actual[count]);
-        if (count >= 4 && dim > 64 && cutoff == 1.f)
-          EXPECT_EQ(std::numeric_limits<float>::infinity(), actual[0]);
-        if (count >= 37 && dim >= 256 && cutoff == 1.f)
-          EXPECT_EQ(std::numeric_limits<float>::infinity(), actual[33]);
       }
     }
+  // Both recursive routes must propagate a failed exceptional computation.
+  for (size_t survivors : {1U, 2U}) {
+    std::vector<T> query(256, encode(.25f));
+    std::vector<std::vector<T>> rows(5, std::vector<T>(256, encode(2.f)));
+    for (size_t row = 0; row < survivors; ++row) rows[row] = query;
+    rows[survivors == 1 ? 0 : 4].back() =
+        encode(std::numeric_limits<float>::quiet_NaN());
+    SplitVector spans[5];
+    for (size_t row = 0; row < 5; ++row)
+      spans[row] = {rows[row].data(), nullptr, 256 * sizeof(T)};
+    float actual[5];
+    EXPECT_FALSE(bounded(spans, 5, query.data(), 256, actual, 1.f));
   }
 }
 

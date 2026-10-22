@@ -15,6 +15,8 @@
 #include "neon/fp32/squared_euclidean.h"
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 #include <limits>
 #include <zvec/ailego/internal/platform.h>
 
@@ -71,7 +73,9 @@ bool split_batch_distance(
   if (dim % 8) return false;
   for (size_t i = 0; i < count; ++i)
     if (vectors[i].first_bytes % (8 * sizeof(float)) ||
-        vectors[i].first_bytes / sizeof(float) > dim)
+        vectors[i].first_bytes / sizeof(float) > dim ||
+        (vectors[i].first_bytes && !vectors[i].first) ||
+        (vectors[i].first_bytes / sizeof(float) < dim && !vectors[i].second))
       return false;
   const auto *q = static_cast<const float *>(query);
   size_t i = 0;
@@ -122,8 +126,9 @@ bool split_batch_distance(
             // For long rows, recompute the winner with the ordinary reduction.
             const size_t row = __builtin_ctz(survivors);
             float distance;
-            split_batch_distance<false>(vectors + i + row, 1, query, dim,
-                                        &distance, 0);
+            if (!split_batch_distance<false>(vectors + i + row, 1, query, dim,
+                                             &distance, 0))
+              return false;
             for (size_t r = 0; r < 4; ++r)
               distances[i + r] = std::numeric_limits<float>::infinity();
             distances[i + row] = distance;
@@ -134,15 +139,21 @@ bool split_batch_distance(
       }
     }
     if (!single_survivor)
-      for (size_t row = 0; row < 4; ++row)
+      for (size_t row = 0; row < 4; ++row) {
         distances[i + row] = rejected ? std::numeric_limits<float>::infinity()
                                       : vaddvq_f32(vaddq_f32(sum0[row], sum1[row]));
+        uint32_t bits;
+        std::memcpy(&bits, &distances[i + row], sizeof(bits));
+        if ((bits & 0x7fffffffU) > 0x7f800000U) return false;
+      }
     i += 4;
     if constexpr (Bounded) {
       // Retry at the next 32-row chunk when one group could not be rejected.
       if (!rejected && !single_survivor) {
         const size_t rest = std::min(count - i, (32 - i % 32) % 32);
-        split_batch_distance<false>(vectors + i, rest, query, dim, distances + i, 0);
+        if (!split_batch_distance<false>(vectors + i, rest, query, dim,
+                                         distances + i, 0))
+          return false;
         i += rest;
       }
     }
@@ -163,6 +174,9 @@ bool split_batch_distance(
     accumulate(vectors[i].first, first_dim);
     accumulate(vectors[i].second, dim - first_dim);
     distances[i] = vaddvq_f32(vaddq_f32(sum0, sum1));
+    uint32_t bits;
+    std::memcpy(&bits, &distances[i], sizeof(bits));
+    if ((bits & 0x7fffffffU) > 0x7f800000U) return false;
   }
   return true;
 #else
@@ -217,8 +231,14 @@ void squared_euclidean_fp32_batch_distance(
           sum1[row] = vfmaq_f32(sum1[row], diff1, diff1);
         }
       }
-      for (size_t row = 0; row < 4; ++row)
+      for (size_t row = 0; row < 4; ++row) {
         distances[i + row] = vaddvq_f32(vaddq_f32(sum0[row], sum1[row]));
+        uint32_t bits;
+        std::memcpy(&bits, &distances[i + row], sizeof(bits));
+        if ((bits & 0x7fffffffU) > 0x7f800000U)
+          squared_euclidean_fp32_distance(vectors[i + row], query, dim,
+                                          distances + i + row);
+      }
     }
   }
 #endif

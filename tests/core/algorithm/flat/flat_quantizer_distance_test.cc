@@ -46,6 +46,27 @@ class DistinctPointQuantizer : public turbo::Fp32Quantizer {
   mutable size_t point_calls{0};
 };
 
+class RejectingSplitQuantizer : public turbo::Fp32Quantizer {
+ public:
+  explicit RejectingSplitQuantizer(bool reject) : reject_(reject) {}
+  turbo::SplitDistanceQuantizer::Distance split_distance() const override {
+    if (!reject_) return nullptr;
+    return [](const turbo::SplitVector *, size_t count, const void *, size_t,
+              float *scores, float) {
+      ++calls();
+      std::fill_n(scores, count, -1e6f);
+      return false;
+    };
+  }
+  static size_t &calls() {
+    static size_t count = 0;
+    return count;
+  }
+
+ private:
+  bool reject_;
+};
+
 template <typename T>
 void CheckMatrices(IndexMeta::DataType type, const std::string &metric_name) {
   // Unequal batch widths catch output transposition; dimensions also exercise
@@ -203,6 +224,88 @@ TEST(FlatQuantizerDistance, FilteredStreamerKeepsPointDispatch) {
       ASSERT_EQ(0, entity.close());
       ASSERT_EQ(0, storage->close());
     }
+  }
+}
+
+TEST(FlatQuantizerDistance, RejectedSplitOverwritesPoisonedScores) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  const std::string path = "flat_rejected_split.index";
+  auto cleanup = ailego::ScopeGuard::Make([&] {
+    ailego::File::RemovePath(path);
+    EXPECT_EQ(0, pool.init(capacity));
+  });
+  const size_t dim = ailego::kVectorPageSize / (32 * sizeof(float)) + 65;
+  IndexMeta meta(IndexMeta::DT_FP32, dim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  std::vector<std::pair<uint64_t, uint32_t>> expected[2][2];
+  for (bool reject : {false, true}) {
+    SCOPED_TRACE(reject);
+    auto quantizer = std::make_shared<RejectingSplitQuantizer>(reject);
+    ASSERT_EQ(0, quantizer->init(meta, ailego::Params()));
+    ailego::File::RemovePath(path);
+    auto storage = IndexFactory::CreateStorage("BufferStorage");
+    ASSERT_EQ(0, storage->init(ailego::Params()));
+    ASSERT_EQ(0, storage->open(path, true));
+    IndexStreamer::Stats stats;
+    FlatStreamerEntity entity(stats);
+    *entity.mutable_meta() = meta;
+    entity.set_quantizer(quantizer);
+    entity.set_block_vector_count(32);
+    entity.set_segment_size(1U << 20);
+    ASSERT_EQ(0, entity.open(storage, meta));
+    std::vector<float> row(dim), query(dim, .1f);
+    for (uint64_t id = 0; id < 67; ++id) {
+      for (size_t d = 0; d < dim; ++d)
+        row[d] =
+            float(int((id * 37 + d * 19 + id * d * 7) % 997) - 498) * .0031f;
+      ASSERT_EQ(0, entity.add(id, row.data(), meta.element_size()));
+    }
+    for (bool read_only : {false, true}) {
+      if (read_only) {
+        ASSERT_EQ(0, entity.flush(0));
+        ASSERT_EQ(0, entity.close());
+        ASSERT_EQ(0, storage->close());
+        ASSERT_EQ(0, storage->open(path, false));
+        entity.set_read_only(true);
+        ASSERT_EQ(0, entity.open(storage, meta));
+      }
+      FlatSearchScratch scratch;
+      for (bool filtered : {false, true}) {
+        IndexFilter filter;
+        if (filtered) filter.set([](uint64_t key) { return key % 2 == 0; });
+        for (int repeat = 0; repeat < 2; ++repeat) {
+          IndexDocumentHeap heap(11);
+          IndexContext::Stats counters;
+          uint32_t scanned = 0;
+          RejectingSplitQuantizer::calls() = 0;
+          ASSERT_EQ(0, entity.search(query.data(), filter, &scanned, &heap,
+                                     &counters, &scratch));
+          EXPECT_EQ(67U, scanned);
+          if (reject && !filtered)
+            EXPECT_GT(RejectingSplitQuantizer::calls(), 0U);
+          heap.sort();
+          std::vector<std::pair<uint64_t, uint32_t>> actual;
+          ASSERT_EQ(11U, heap.size());
+          for (size_t i = 0; i < heap.size(); ++i) {
+            const auto &document = heap[i];
+            const float score = document.score();
+            uint32_t bits;
+            std::memcpy(&bits, &score, sizeof(bits));
+            actual.emplace_back(document.key(), bits);
+          }
+          if (!reject)
+            expected[read_only][filtered] = actual;
+          else
+            EXPECT_EQ(expected[read_only][filtered], actual);
+          if (read_only) EXPECT_FALSE(scratch.vector_page_ids.empty());
+          EXPECT_TRUE(scratch.vector_blocks.empty());
+        }
+      }
+    }
+    ASSERT_EQ(0, entity.close());
+    ASSERT_EQ(0, storage->close());
   }
 }
 

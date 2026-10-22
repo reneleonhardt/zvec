@@ -104,6 +104,9 @@ bool split_batch(const SplitVector *vectors, size_t count, const void *query,
       const float sum = reduce<T, Dot>(sums[row]);
       distances[i + row] = rejected ? std::numeric_limits<float>::infinity()
                                     : (Dot ? -sum : sum);
+      uint32_t bits;
+      std::memcpy(&bits, &distances[i + row], sizeof(bits));
+      if ((bits & 0x7fffffffU) > 0x7f800000U) return false;
     }
     i += rows;
   }

@@ -13,6 +13,8 @@
 // limitations under the License.
 
 #include "neon/fp16/inner_product.h"
+#include <cstdint>
+#include <cstring>
 #include <zvec/ailego/internal/platform.h>
 
 // MSVC may lack of fp16 support, fallback to scalar for now
@@ -97,8 +99,13 @@ void inner_product_fp16_batch_distance(const void *const *vectors,
       for (size_t row = 0; row < 4; ++row)
         totals[row] += static_cast<float>(rows[row][d]) * value;
     }
-    for (size_t row = 0; row < 4; ++row)
+    for (size_t row = 0; row < 4; ++row) {
       distances[i + row] = -totals[row];
+      uint32_t bits;
+      std::memcpy(&bits, &distances[i + row], sizeof(bits));
+      if ((bits & 0x7fffffffU) > 0x7f800000U)
+        inner_product_fp16_distance(rows[row], query, dim, distances + i + row);
+    }
   }
 #endif
   for (; i < n; ++i) {

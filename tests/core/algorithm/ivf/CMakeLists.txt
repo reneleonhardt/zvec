@@ -11,4 +11,7 @@ foreach(CC_SRCS ${ALL_TEST_SRCS})
       SRCS ${CC_SRCS}
       INCS . ${PROJECT_ROOT_DIR}/src ${PROJECT_ROOT_DIR}/src/core ${PROJECT_ROOT_DIR}/src/core/algorithm/ivf
     )
+  if(CC_TARGET STREQUAL "ivf_index_provider_test" OR CC_TARGET STREQUAL "ivf_searcher_test")
+    target_include_directories(${CC_TARGET} PRIVATE ${PROJECT_ROOT_DIR}/src/turbo)
+  endif()
 endforeach()
