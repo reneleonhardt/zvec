@@ -466,6 +466,8 @@ TEST(Cube, SmallValuesSurviveMovesAndSwaps) {
     assigned = std::move(moved);
     EXPECT_TRUE(moved.empty());
     EXPECT_EQ(value, assigned.cast<int>());
+    assigned.swap(assigned);
+    EXPECT_EQ(value, assigned.cast<int>());
     Cube other(3.25f);
     assigned.swap(other);
     EXPECT_EQ(value, other.cast<int>());

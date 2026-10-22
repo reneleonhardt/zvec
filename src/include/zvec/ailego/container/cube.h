@@ -321,6 +321,7 @@ class Cube {
 
   //! Swap the content with another Cube
   Cube &swap(Cube &rhs) {
+    if (this == &rhs) return *this;
     std::swap(policy_, rhs.policy_);
     unsigned char temporary[sizeof(object_)];
     std::memcpy(temporary, &object_, sizeof(object_));
