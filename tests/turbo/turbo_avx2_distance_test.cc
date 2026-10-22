@@ -70,10 +70,14 @@ void CheckSplits(DataType type, QuantizeType quantize,
           }
           std::array<float, 9> expected, actual, batched;
           std::array<const void *, 9> pointers;
-          for (size_t row = 0; row < 9; ++row) {
+          for (size_t row = 0; row < 9; ++row)
             pointers[row] = rows.data() + row * dim;
-            kernels.batch(pointers.data() + row, query.data(), 1, dim,
+          for (size_t row = 0; row < 9;) {
+            const size_t count =
+                arch == CpuArchType::kAVX512 && row + 1 < 9 ? 2 : 1;
+            kernels.batch(pointers.data() + row, query.data(), count, dim,
                           expected.data() + row, nullptr);
+            row += count;
           }
           kernels.batch(pointers.data(), query.data(), 9, dim, batched.data(),
                         nullptr);
@@ -106,14 +110,17 @@ void CheckSplits(DataType type, QuantizeType quantize,
                 << "dim=" << dim << " cut=" << cut
                 << " metric=" << metric_index;
             if (metric_index == 0) {
-              const float cutoff = expected[4];
-              ASSERT_TRUE(splits[0](vectors.data(), 9, query.data(), dim,
-                                    actual.data(), cutoff));
-              for (size_t row = 0; row < 9; ++row) {
-                if (!(std::isinf(actual[row]) && expected[row] >= cutoff)) {
-                  EXPECT_EQ(0, std::memcmp(&expected[row], &actual[row],
-                                           sizeof(float)));
+              for (float cutoff : {expected[4], .01f}) {
+                ASSERT_TRUE(splits[0](vectors.data(), 9, query.data(), dim,
+                                      actual.data(), cutoff));
+                for (size_t row = 0; row < 9; ++row) {
+                  if (!(std::isinf(actual[row]) && expected[row] >= cutoff)) {
+                    EXPECT_EQ(0, std::memcmp(&expected[row], &actual[row],
+                                             sizeof(float)));
+                  }
                 }
+                if (cutoff == .01f && dim > 64 && special < 2)
+                  EXPECT_TRUE(std::isinf(actual[4]));
               }
             }
           }

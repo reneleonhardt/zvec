@@ -111,6 +111,13 @@ void squared_euclidean_batch(const void *const *vectors, const void *query,
         typed_query, reinterpret_cast<const float *const *>(&vectors[i]),
         prefetch_ptrs, dim, distances + i);
   }
+  if (i + 2 <= n) {
+    std::array<const float *, 2> prefetch_ptrs{nullptr, nullptr};
+    squared_euclidean_batch_impl<2>(
+        typed_query, reinterpret_cast<const float *const *>(&vectors[i]),
+        prefetch_ptrs, dim, distances + i);
+    i += 2;
+  }
   for (; i < n; i++) {
     std::array<const float *, 1> prefetch_ptrs{nullptr};
     squared_euclidean_batch_impl<1>(

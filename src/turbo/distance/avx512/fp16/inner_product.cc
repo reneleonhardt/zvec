@@ -114,9 +114,9 @@ void inner_product_batch_impl(
 }
 
 // Dispatch batched inner product over all `n` vectors with prefetching.
+template <size_t batch_size>
 void inner_product_batch(const void *const *vectors, const void *query,
                          size_t n, size_t dim, float *distances) {
-  static constexpr size_t batch_size = 4;
   static constexpr size_t prefetch_step = 2;
   const ailego::Float16 *typed_query =
       static_cast<const ailego::Float16 *>(query);
@@ -134,6 +134,12 @@ void inner_product_batch(const void *const *vectors, const void *query,
     inner_product_batch_impl<batch_size>(
         typed_query,
         reinterpret_cast<const ailego::Float16 *const *>(&vectors[i]),
+        prefetch_ptrs, dim, distances + i);
+  }
+  for (; i + 2 <= n; i += 2) {
+    std::array<const ailego::Float16 *, 2> prefetch_ptrs{nullptr, nullptr};
+    inner_product_batch_impl<2>(
+        typed_query, reinterpret_cast<const ailego::Float16 *const *>(&vectors[i]),
         prefetch_ptrs, dim, distances + i);
   }
   for (; i < n; i++) {
@@ -165,7 +171,11 @@ void inner_product_fp16_batch_distance_avx512(
     const void *const *vectors, const void *query, size_t n, size_t dim,
     float *distances, const void *const * /*extra_values*/) {
 #if ZVEC_TURBO_FP16_AVX512
-  inner_product_batch(vectors, query, n, dim, distances);
+  // Preserve the original scalar-tail kernel and prefetch schedule.
+  if (dim % 16)
+    inner_product_batch<2>(vectors, query, n, dim, distances);
+  else
+    inner_product_batch<4>(vectors, query, n, dim, distances);
 #else
   (void)vectors;
   (void)query;
