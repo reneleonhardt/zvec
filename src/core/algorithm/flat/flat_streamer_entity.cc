@@ -580,9 +580,10 @@ int FlatStreamerEntity::search_borrowed_block(
 #endif
   auto &pointers = scratch->vector_ptrs;
   pointers.clear();
-  // An unfiltered single-row block uses the point kernel in the owned path.
-  const bool point_distance = header->vector_count == 1 && !filter.is_valid() &&
-                              !deletion_map->is_dirty();
+  // Match the owned path: filtered rows and singleton blocks use point kernels.
+  // Batch reductions can round differently even for finite inputs.
+  const bool point_distance = header->vector_count == 1 || filter.is_valid() ||
+                              deletion_map->is_dirty();
   if (resident && split_distance_ && !point_distance) {
     auto &vectors = scratch->split_vectors;
     vectors.clear();
@@ -658,9 +659,10 @@ int FlatStreamerEntity::search_borrowed_block(
   }
   auto *distances = scratch->distances.data();
   if (quantizer_) {
-    if (point_distance)
-      distances[0] = quantizer_->calc_distance_dp_query(pointers[0], query);
-    else if (!try_bounded_distances(query, pointers.data(), pointers.size(),
+    if (point_distance) {
+      for (size_t i = 0; i < pointers.size(); ++i)
+        distances[i] = quantizer_->calc_distance_dp_query(pointers[i], query);
+    } else if (!try_bounded_distances(query, pointers.data(), pointers.size(),
                                    distances, scratch, heap))
       quantizer_->calc_distance_dp_query_batch(
           pointers.data(), static_cast<int>(pointers.size()), query, distances);
@@ -785,31 +787,6 @@ void FlatStreamerEntity::search_block(
   }
   if (!keeps.is_dirty()) {
     (*context_stats->mutable_filtered_count()) += hd->vector_count;
-    return;
-  }
-  if (quantizer_) {
-    auto &pointers = scratch->vector_ptrs;
-    pointers.clear();
-    pointers.reserve(hd->vector_count);
-    for (size_t k = 0; k < hd->vector_count; ++k) {
-      if (keeps.test(k)) {
-        pointers.push_back(vecs + index_meta_.element_size() * k);
-      }
-    }
-    if (norm_val != 1.0f ||
-        !try_bounded_distances(query, pointers.data(), pointers.size(), distances,
-                                scratch, heap))
-      quantizer_->calc_distance_dp_query_batch(
-          pointers.data(), static_cast<int>(pointers.size()), query, distances);
-    *context_stats->mutable_dist_calced_count() += pointers.size();
-    *context_stats->mutable_filtered_count() +=
-        hd->vector_count - pointers.size();
-    size_t accepted = 0;
-    for (size_t k = 0; k < hd->vector_count; ++k) {
-      if (keeps.test(k)) {
-        heap->emplace(keys[k], distances[accepted++] * norm_val);
-      }
-    }
     return;
   }
   for (size_t k = 0; k < hd->vector_count; ++k) {

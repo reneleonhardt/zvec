@@ -12,16 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <cmath>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/core/framework/index_factory.h>
 #include "flat/flat_distance_matrix.h"
+#include "flat/flat_streamer_entity.h"
 #include "quantizer/distance_quantizer.h"
+#include "quantizer/fp32_quantizer/fp32_quantizer.h"
 
 using namespace zvec;
 using namespace zvec::core;
 
 namespace {
+class DistinctPointQuantizer : public turbo::Fp32Quantizer {
+ public:
+  float calc_distance_dp_query(const void *dp, const void *) const override {
+    ++point_calls;
+    return *static_cast<const float *>(dp);
+  }
+  void calc_distance_dp_query_batch(const void *const *, int count,
+                                    const void *,
+                                    float *scores) const override {
+    std::fill_n(scores, count, -1.0f);
+  }
+  turbo::SplitDistanceQuantizer::Distance split_distance() const override {
+    return [](const turbo::SplitVector *, size_t count, const void *, size_t,
+              float *scores, float) {
+      std::fill_n(scores, count, -2.0f);
+      return true;
+    };
+  }
+  mutable size_t point_calls{0};
+};
+
 template <typename T>
 void CheckMatrices(IndexMeta::DataType type, const std::string &metric_name) {
   // Unequal batch widths catch output transposition; dimensions also exercise
@@ -92,6 +116,95 @@ void CheckMatrices(IndexMeta::DataType type, const std::string &metric_name) {
   }
 }
 }  // namespace
+
+TEST(FlatQuantizerDistance, FilteredStreamerKeepsPointDispatch) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  const std::string path = "flat_point_dispatch.index";
+  auto cleanup = ailego::ScopeGuard::Make([&]() {
+    ailego::File::RemovePath(path);
+    EXPECT_EQ(0, pool.init(capacity));
+  });
+  // Whole blocks exceed one page on every platform; rows also cross pages.
+  const size_t dim = ailego::kVectorPageSize / (32 * sizeof(float)) + 65;
+  IndexMeta meta(IndexMeta::DT_FP32, dim);
+  meta.set_metric("SquaredEuclidean", 0, ailego::Params());
+  auto quantizer = std::make_shared<DistinctPointQuantizer>();
+  ASSERT_EQ(0, quantizer->init(meta, ailego::Params()));
+  for (const auto *backend : {"MMapFileStorage", "BufferStorage"}) {
+    for (bool deleted : {false, true}) {
+      SCOPED_TRACE(std::string(backend) + (deleted ? " deleted" : " filtered"));
+      ailego::File::RemovePath(path);
+      auto storage = IndexFactory::CreateStorage(backend);
+      ASSERT_EQ(0, storage->init(ailego::Params()));
+      ASSERT_EQ(0, storage->open(path, true));
+      IndexStreamer::Stats stats;
+      FlatStreamerEntity entity(stats);
+      *entity.mutable_meta() = meta;
+      entity.set_quantizer(quantizer);
+      entity.set_block_vector_count(32);
+      entity.set_segment_size(1U << 20);
+      ASSERT_EQ(0, entity.open(storage, meta));
+      std::vector<float> row(dim);
+      for (uint64_t id = 0; id < 64; ++id) {
+        row[0] = float(id) + .25f;
+        ASSERT_EQ(0, entity.add(id, row.data(), meta.element_size()));
+      }
+      if (deleted) {
+        // Mark the first row in each serialized block deleted, with no filter.
+        auto segment = storage->get("flat.features1");
+        ASSERT_NE(nullptr, segment);
+        DeletionMap map;
+        map.set(0);
+        for (size_t block = 1; block <= 2; ++block)
+          ASSERT_EQ(sizeof(map),
+                    segment->write(block * entity.linear_block_size() -
+                                       sizeof(BlockHeader) - sizeof(map),
+                                   &map, sizeof(map)));
+      }
+      IndexFilter filter;
+      if (!deleted) filter.set([](uint64_t id) { return id % 2 == 0; });
+      for (bool read_only : {false, true}) {
+        if (read_only) {
+          ASSERT_EQ(0, entity.flush(0));
+          ASSERT_EQ(0, entity.close());
+          ASSERT_EQ(0, storage->close());
+          ASSERT_EQ(0, storage->open(path, false));
+          entity.set_read_only(true);
+          ASSERT_EQ(0, entity.open(storage, meta));
+        }
+        FlatSearchScratch scratch;
+        for (int repeat = 0; repeat < 2; ++repeat) {
+          IndexDocumentHeap heap(4);
+          IndexContext::Stats context_stats;
+          uint32_t scanned = 0;
+          quantizer->point_calls = 0;
+          ASSERT_EQ(0, entity.search(row.data(), filter, &scanned, &heap,
+                                     &context_stats, &scratch));
+          EXPECT_EQ(64U, scanned);
+          EXPECT_EQ(deleted ? 62U : 32U, quantizer->point_calls);
+          EXPECT_EQ(deleted ? 2U : 32U, context_stats.filtered_count());
+          heap.sort();
+          ASSERT_EQ(4U, heap.size());
+          for (size_t i = 0; i < heap.size(); ++i) {
+            const uint64_t key = deleted ? i + 1 : i * 2 + 1;
+            const float expected = float(key) + .25f;
+            const float actual = heap[i].score();
+            EXPECT_EQ(key, heap[i].key());
+            EXPECT_EQ(0, std::memcmp(&expected, &actual, sizeof(float)));
+          }
+          if (read_only && std::string(backend) == "BufferStorage") {
+            EXPECT_FALSE(scratch.vector_page_ids.empty());
+          }
+          EXPECT_TRUE(scratch.vector_blocks.empty());
+        }
+      }
+      ASSERT_EQ(0, entity.close());
+      ASSERT_EQ(0, storage->close());
+    }
+  }
+}
 
 TEST(FlatQuantizerDistance, Fp32Matrices) {
   for (const auto *name : {"SquaredEuclidean", "InnerProduct", "Cosine"}) {

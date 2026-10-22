@@ -335,6 +335,7 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
         };
         context->reset_filter();
         if (mode) context->set_filter(excluded);
+        scratch->vector_buffer.clear();
         ASSERT_EQ(0,
                   streamer->search_bf_impl(
                       quantizer ? static_cast<const void *>(query_code.data())
@@ -364,7 +365,8 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
               32 * meta.element_size());
           EXPECT_GT(scratch->vector_page_ids.capacity(), 0U);
 #if defined(AILEGO_ARM64_NEON)
-          if (format == 2) EXPECT_TRUE(scratch->vector_buffer.empty());
+          if (format == 2 && mode == 0)
+            EXPECT_TRUE(scratch->vector_buffer.empty());
 #endif
         } else {
           EXPECT_GE(
@@ -382,7 +384,7 @@ TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
   }
 }
 
-TEST_F(FlatStreamerTest, FilteredQuantizerBatchesMatchScalarDistances) {
+TEST_F(FlatStreamerTest, FilteredQuantizerMatchesScalarDistances) {
   auto &pool = MemoryLimitPool::get_instance();
   const auto capacity = pool.capacity();
   ASSERT_EQ(0, pool.init(64UL << 20));
@@ -464,7 +466,7 @@ TEST_F(FlatStreamerTest, FilteredQuantizerBatchesMatchScalarDistances) {
         auto *scratch = static_cast<FlatStreamerContext<32> *>(context.get())
                             ->search_scratch();
 #if defined(AILEGO_ARM64_NEON)
-        if (warmed) EXPECT_TRUE(scratch->vector_buffer.empty());
+        if (warmed && mode == 0) EXPECT_TRUE(scratch->vector_buffer.empty());
 #endif
         scratch->vector_buffer.clear();
         warmed = true;
