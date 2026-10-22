@@ -38,21 +38,14 @@ bool fp16_cosine_decode(const uint16_t *input, size_t dim, float norm,
           _mm256_and_si256(bits, _mm256_set1_epi32(0x7fffffff));
       const __m256i outside = _mm256_or_si256(
           _mm256_cmpgt_epi32(_mm256_set1_epi32(0x38800000), magnitude),
-          _mm256_cmpgt_epi32(magnitude, _mm256_set1_epi32(0x477fffff)));
+          _mm256_cmpgt_epi32(magnitude, _mm256_set1_epi32(0x477fefff)));
       if (!_mm256_movemask_epi8(outside)) {
-        // Float16's scalar conversion rounds ties away, rather than to even.
-        const __m256i rounded = _mm256_srli_epi32(
-            _mm256_add_epi32(
-                _mm256_sub_epi32(magnitude, _mm256_set1_epi32(0x38000000)),
-                _mm256_set1_epi32(0x1000)),
-            13);
-        const __m256i sign = _mm256_and_si256(_mm256_srli_epi32(bits, 16),
-                                              _mm256_set1_epi32(0x8000));
-        const __m256i packed = _mm256_packus_epi32(
-            _mm256_or_si256(rounded, sign), _mm256_setzero_si256());
-        const __m128i restored =
-            _mm_unpacklo_epi64(_mm256_castsi256_si128(packed),
-                               _mm256_extracti128_si256(packed, 1));
+        // Round ties away in integer bits, then convert an exact finite half.
+        const __m256i rounded =
+            _mm256_and_si256(_mm256_add_epi32(bits, _mm256_set1_epi32(0x1000)),
+                             _mm256_set1_epi32(-8192));
+        const __m128i restored = _mm256_cvtps_ph(_mm256_castsi256_ps(rounded),
+                                                 _MM_FROUND_TO_NEAREST_INT);
         _mm256_storeu_ps(output + i, _mm256_cvtph_ps(restored));
         continue;
       }

@@ -23,15 +23,22 @@
 #include <random>
 #include <string>
 #include <vector>
+#include <ailego/internal/cpu_features.h>
 #include <ailego/math/normalizer.h>
 #include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
+#include <turbo/conversion/avx2/cosine_decode.h>
+#include <turbo/conversion/avx512/cosine_decode.h>
 #include <turbo/distance/neon_fp16/fp16/cosine.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/turbo/turbo.h>
 #include "zvec/core/framework/index_factory.h"
+
+#if defined(__x86_64__) || defined(_M_X64)
+#include <immintrin.h>
+#endif
 
 using namespace zvec;
 using namespace zvec::core;
@@ -347,6 +354,82 @@ TEST(Fp16Quantizer, DecodePreservesBitsForEveryHalfEncoding) {
       }
     }
   }
+}
+
+TEST(Fp16Quantizer, CosineDecodePreservesBitsAndExceptionFlags) {
+#if defined(__x86_64__) || defined(_M_X64)
+  const auto &features = ailego::internal::CpuFeatures::static_flags_;
+  if (!features.AVX2 || !features.F16C) GTEST_SKIP();
+  if (!turbo::avx2::fp16_cosine_decode(nullptr, 0, 0.f, nullptr)) GTEST_SKIP();
+  using Decode = bool (*)(const uint16_t *, size_t, float, float *);
+  std::vector<Decode> kernels = {turbo::avx2::fp16_cosine_decode};
+  if (features.AVX512F && features.AVX512DQ && features.AVX512BW &&
+      features.AVX512VL &&
+      turbo::avx512::fp16_cosine_decode(nullptr, 0, 0.f, nullptr))
+    kernels.push_back(turbo::avx512::fp16_cosine_decode);
+
+  const int rounding = std::fegetround();
+  const unsigned original_csr = _mm_getcsr();
+  auto restore = ScopeGuard::Make([&]() {
+    std::fesetround(rounding);
+    _mm_setcsr(original_csr);
+  });
+  const std::array<float, 15> norms = {0.f,         -0.f,
+                                       1.f,         -1.f,
+                                       .003f,       2.3f,
+                                       1000.f,      1.00048828125f,
+                                       0x1p-25f,    0x1p-126f,
+                                       0x1p-149f,   0x1.fffffep-15f,
+                                       0x1p-14f,    0x1.ffdffep+15f,
+                                       0x1.ffep+15f};
+  auto check = [&](Decode decode, const uint16_t *input, size_t dim,
+                   float norm) {
+    std::vector<float> expected(dim + 2, 42.25f), actual(expected);
+    const unsigned csr = _mm_getcsr() & ~0x3fu;
+    std::feclearexcept(FE_ALL_EXCEPT);
+    _mm_setcsr(csr);
+    for (size_t i = 0; i < dim; ++i) {
+      const float scaled = FloatHelper::ToFP32(input[i]) * norm;
+      expected[i + 1] = FloatHelper::ToFP32(FloatHelper::ToFP16(scaled));
+    }
+    const int expected_flags = std::fetestexcept(FE_ALL_EXCEPT);
+    std::feclearexcept(FE_ALL_EXCEPT);
+    _mm_setcsr(csr);
+    const bool supported = decode(input, dim, norm, actual.data() + 1);
+    const int actual_flags = std::fetestexcept(FE_ALL_EXCEPT);
+    ASSERT_TRUE(supported);
+    ASSERT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                             expected.size() * sizeof(float)))
+        << "dim=" << dim << " norm=" << norm;
+    ASSERT_EQ(expected_flags, actual_flags)
+        << "dim=" << dim << " norm=" << norm;
+  };
+  std::vector<uint16_t> all_half(65537);
+  for (size_t i = 0; i < 65536; ++i) all_half[i + 1] = static_cast<uint16_t>(i);
+  const std::array<uint16_t, 16> edges = {
+      0x3c00, 0xbc00, 0x3555, 0xb555, 0x0400, 0x8400, 0x7bff, 0xfbff,
+      0x0001, 0x8001, 0x0000, 0x8000, 0x7e11, 0x7d02, 0xfe23, 0x7c00};
+  std::array<uint16_t, 35> short_input;
+  for (size_t i = 0; i < short_input.size(); ++i)
+    short_input[i] = edges[i % edges.size()];
+  std::array<uint16_t, 33> normal_input;
+  for (size_t i = 0; i < normal_input.size(); ++i)
+    normal_input[i] = edges[i % 8];
+  for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+    ASSERT_EQ(0, std::fesetround(mode));
+    for (Decode decode : kernels) {
+      for (float norm : norms) {
+        check(decode, all_half.data() + 1, 65536, norm);
+        for (size_t dim = 0; dim <= 33; ++dim)
+          check(decode, short_input.data() + 1, dim, norm);
+        for (size_t dim : {16U, 17U, 32U, 33U})
+          check(decode, normal_input.data(), dim, norm);
+      }
+    }
+  }
+#else
+  GTEST_SKIP();
+#endif
 }
 
 TEST(Fp16Quantizer, StoragePrecisionConvertsBeforeCosineNormalization) {
