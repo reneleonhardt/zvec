@@ -66,15 +66,6 @@ void squared_euclidean_batch_impl(
     const __m512 q1 = _mm512_cvtph_ps(_mm512_castsi512_si256(q));
     const __m512 q2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(q, 1));
 
-    __m512 data_regs_1[dp_batch];
-    __m512 data_regs_2[dp_batch];
-    for (size_t i = 0; i < dp_batch; ++i) {
-      const __m512i m =
-          _mm512_loadu_si512(reinterpret_cast<const __m512i *>(ptrs[i] + dim));
-      data_regs_1[i] = _mm512_cvtph_ps(_mm512_castsi512_si256(m));
-      data_regs_2[i] = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(m, 1));
-    }
-
     if (prefetch_ptrs[0]) {
       for (size_t i = 0; i < dp_batch; ++i) {
         if (prefetch_ptrs[i]) ailego_prefetch(prefetch_ptrs[i] + dim);
@@ -82,9 +73,13 @@ void squared_euclidean_batch_impl(
     }
 
     for (size_t i = 0; i < dp_batch; ++i) {
-      const __m512 diff1 = _mm512_sub_ps(q1, data_regs_1[i]);
+      const __m512i m =
+          _mm512_loadu_si512(reinterpret_cast<const __m512i *>(ptrs[i] + dim));
+      const __m512 data1 = _mm512_cvtph_ps(_mm512_castsi512_si256(m));
+      const __m512 diff1 = _mm512_sub_ps(q1, data1);
       accs[i] = _mm512_fmadd_ps(diff1, diff1, accs[i]);
-      const __m512 diff2 = _mm512_sub_ps(q2, data_regs_2[i]);
+      const __m512 data2 = _mm512_cvtph_ps(_mm512_extracti64x4_epi64(m, 1));
+      const __m512 diff2 = _mm512_sub_ps(q2, data2);
       accs[i] = _mm512_fmadd_ps(diff2, diff2, accs[i]);
     }
   }
@@ -142,10 +137,21 @@ void squared_euclidean_batch(const void *const *vectors, const void *query,
         reinterpret_cast<const ailego::Float16 *const *>(&vectors[i]),
         prefetch_ptrs, dim, distances + i);
   }
+  if constexpr (batch_size > 4) {
+    if (i + 4 <= n) {
+      std::array<const ailego::Float16 *, 4> prefetch_ptrs{};
+      squared_euclidean_batch_impl<4>(
+          typed_query,
+          reinterpret_cast<const ailego::Float16 *const *>(&vectors[i]),
+          prefetch_ptrs, dim, distances + i);
+      i += 4;
+    }
+  }
   for (; i + 2 <= n; i += 2) {
     std::array<const ailego::Float16 *, 2> prefetch_ptrs{nullptr, nullptr};
     squared_euclidean_batch_impl<2>(
-        typed_query, reinterpret_cast<const ailego::Float16 *const *>(&vectors[i]),
+        typed_query,
+        reinterpret_cast<const ailego::Float16 *const *>(&vectors[i]),
         prefetch_ptrs, dim, distances + i);
   }
   for (; i < n; i++) {
@@ -181,7 +187,7 @@ void squared_euclidean_fp16_batch_distance_avx512(
   if (dim % 16)
     squared_euclidean_batch<2>(vectors, query, n, dim, distances);
   else
-    squared_euclidean_batch<4>(vectors, query, n, dim, distances);
+    squared_euclidean_batch<8>(vectors, query, n, dim, distances);
 #else
   (void)vectors;
   (void)query;

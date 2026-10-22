@@ -112,7 +112,7 @@ inline void PrefetchRow(const void *vector, size_t dimension) {
   const auto *row = static_cast<const char *>(vector);
   _mm_prefetch(row, _MM_HINT_T0);
 
-  // A SIFT FP16 row is only 256 bytes and the four-way kernel below already
+  // A SIFT FP16 row is only 256 bytes and the short-row kernel below already
   // leaves enough sequential work for the hardware prefetchers.  GIST rows
   // are 1920 bytes, however, and candidate ids arrive in graph order, so the
   // first few demand loads otherwise serialize on unrelated cache lines.
@@ -153,6 +153,28 @@ void PrefetchAndCompute(const void *const *vectors, const uint16_t *query,
   }
 }
 
+template <size_t Batch>
+void ShortBatches(const void *const *vectors, const uint16_t *query,
+                  size_t count, size_t dimension, float *distances) {
+  for (size_t i = 0; i < std::min(count, Batch); ++i)
+    PrefetchRow(vectors[i], dimension);
+  size_t i = 0;
+  for (; i + Batch <= count; i += Batch) {
+    const size_t next = i + Batch;
+    for (size_t lane = 0; lane < std::min(Batch, count - next); ++lane)
+      PrefetchRow(vectors[next + lane], dimension);
+    DistanceBatch<Batch>(vectors + i, query, dimension, distances + i);
+  }
+  if constexpr (Batch > 4) {
+    if (i + 4 <= count) {
+      DistanceBatch<4>(vectors + i, query, dimension, distances + i);
+      i += 4;
+    }
+  }
+  for (; i < count; ++i)
+    DistanceBatch<1>(vectors + i, query, dimension, distances + i);
+}
+
 }  // namespace
 
 void squared_euclidean_fp16_distance(const void *lhs, const void *rhs,
@@ -169,23 +191,10 @@ void squared_euclidean_fp16_batch_distance(
   if (count == 0) return;
 
   if (dimension < 512) {
-    // Preserve the SIFT-tuned path: four rows provide sufficient MLP without
-    // increasing register pressure for short vectors.
-    constexpr size_t kBatch = 4;
-    for (size_t i = 0; i < std::min(count, kBatch); ++i) {
-      PrefetchRow(vectors[i], dimension);
-    }
-    size_t i = 0;
-    for (; i + kBatch <= count; i += kBatch) {
-      const size_t next = i + kBatch;
-      for (size_t lane = 0; lane < std::min(kBatch, count - next); ++lane) {
-        PrefetchRow(vectors[next + lane], dimension);
-      }
-      DistanceBatch<kBatch>(vectors + i, query_fp16, dimension, distances + i);
-    }
-    for (; i < count; ++i) {
-      DistanceBatch<1>(vectors + i, query_fp16, dimension, distances + i);
-    }
+    if (dimension % 16)
+      ShortBatches<4>(vectors, query_fp16, count, dimension, distances);
+    else
+      ShortBatches<8>(vectors, query_fp16, count, dimension, distances);
     return;
   }
 

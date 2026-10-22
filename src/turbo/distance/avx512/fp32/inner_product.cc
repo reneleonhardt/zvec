@@ -56,11 +56,6 @@ void inner_product_batch_impl(
   size_t dim = 0;
   for (; dim + 16 <= dimensionality; dim += 16) {
     const __m512 q = _mm512_loadu_ps(query + dim);
-    __m512 data_regs[dp_batch];
-    for (size_t i = 0; i < dp_batch; ++i) {
-      data_regs[i] = _mm512_loadu_ps(ptrs[i] + dim);
-    }
-
     if (prefetch_ptrs[0]) {
       for (size_t i = 0; i < dp_batch; ++i) {
         if (prefetch_ptrs[i]) ailego_prefetch(prefetch_ptrs[i] + dim);
@@ -68,7 +63,8 @@ void inner_product_batch_impl(
     }
 
     for (size_t i = 0; i < dp_batch; ++i) {
-      accs[i] = _mm512_fmadd_ps(q, data_regs[i], accs[i]);
+      const __m512 data = _mm512_loadu_ps(ptrs[i] + dim);
+      accs[i] = _mm512_fmadd_ps(q, data, accs[i]);
     }
   }
 
@@ -90,7 +86,7 @@ void inner_product_batch_impl(
 // Dispatch batched inner product over all `n` vectors with prefetching.
 void inner_product_batch(const void *const *vectors, const void *query,
                          size_t n, size_t dim, float *distances) {
-  static constexpr size_t batch_size = 4;
+  static constexpr size_t batch_size = 8;
   static constexpr size_t prefetch_step = 2;
   const float *typed_query = static_cast<const float *>(query);
   size_t i = 0;
@@ -107,6 +103,13 @@ void inner_product_batch(const void *const *vectors, const void *query,
     inner_product_batch_impl<batch_size>(
         typed_query, reinterpret_cast<const float *const *>(&vectors[i]),
         prefetch_ptrs, dim, distances + i);
+  }
+  if (i + 4 <= n) {
+    std::array<const float *, 4> prefetch_ptrs{};
+    inner_product_batch_impl<4>(
+        typed_query, reinterpret_cast<const float *const *>(&vectors[i]),
+        prefetch_ptrs, dim, distances + i);
+    i += 4;
   }
   if (i + 2 <= n) {
     std::array<const float *, 2> prefetch_ptrs{nullptr, nullptr};
