@@ -22,6 +22,7 @@
 #include <ailego/parallel/lock.h>
 #include <ailego/utility/memory_helper.h>
 #include <turbo/quantizer/quantizer.h>
+#include <turbo/quantizer/split_distance_quantizer.h>
 #include <zvec/ailego/utility/string_helper.h>
 #include <zvec/core/framework/index_context.h>
 #include <zvec/core/framework/index_framework.h>
@@ -34,11 +35,20 @@ namespace core {
 
 //! Reusable request-local buffers for storage-specific Flat search paths.
 struct FlatSearchScratch {
+  struct alignas(AILEGO_CACHE_LINE_SIZE) VectorBufferLine {
+    uint8_t data[AILEGO_CACHE_LINE_SIZE];
+  };
   std::vector<const void *> vector_ptrs{};
   std::vector<const void *> extra_values{};
   std::vector<uint64_t> vector_keys{};
   std::vector<float> distances{};
   std::vector<uint8_t> query_buffer{};
+  std::vector<VectorBufferLine> vector_buffer{};
+  std::vector<IndexStorage::MemoryBlock> vector_blocks{};
+  std::vector<IndexStorage::Segment::BorrowedRead> vector_reads{};
+  std::vector<ailego::block_id_t> vector_page_ids{};
+  std::vector<char *> vector_pages{};
+  std::vector<turbo::SplitVector> split_vectors{};
 };
 
 /*! Flat Streamer Entity
@@ -95,14 +105,16 @@ class FlatStreamerEntity {
   //! Search in a block
   void search_block(const void *query, const BlockLocation &bl,
                     const BlockHeader *hd, float norm_val,
-                    IndexDocumentHeap *heap) const;
+                    IndexDocumentHeap *heap, FlatSearchScratch *scratch,
+                    IndexStorage::Segment *segment = nullptr) const;
 
   //! Search in a block with filter
   void search_block(const void *query, const BlockLocation &bl,
                     const BlockHeader *hd, float norm_val,
                     const IndexFilter &filter, const DeletionMap *deletion_map,
-                    IndexDocumentHeap *heap,
-                    IndexContext::Stats *context_stats) const;
+                    IndexDocumentHeap *heap, IndexContext::Stats *context_stats,
+                    FlatSearchScratch *scratch,
+                    IndexStorage::Segment *segment = nullptr) const;
 
   //! Flat Search with filter
   int search_bf(const void *query, const IndexFilter &filter,
@@ -195,16 +207,22 @@ class FlatStreamerEntity {
   }
 
   inline void row_major_distance(const void *query, const void *feature,
-                                 size_t fnum, float *out) const {
+                                 size_t fnum, float *out,
+                                  FlatSearchScratch *scratch = nullptr,
+                                  const IndexDocumentHeap *heap = nullptr) const {
     const uint8_t *cur_feature = reinterpret_cast<const uint8_t *>(feature);
     if (quantizer_) {
       if (fnum > 1) {
-        std::vector<const void *> dp_list(fnum);
+        std::vector<const void *> fallback;
+        auto &dp_list = scratch ? scratch->vector_ptrs : fallback;
+        dp_list.resize(fnum);
         for (size_t f = 0; f < fnum; ++f) {
           dp_list[f] = cur_feature + f * index_meta_.element_size();
         }
-        quantizer_->calc_distance_dp_query_batch(
-            dp_list.data(), static_cast<int>(fnum), query, out);
+        if (!heap || !try_bounded_distances(query, dp_list.data(), fnum, out,
+                                             scratch, heap))
+          quantizer_->calc_distance_dp_query_batch(
+              dp_list.data(), static_cast<int>(fnum), query, out);
       } else {
         *out = quantizer_->calc_distance_dp_query(cur_feature, query);
       }
@@ -419,28 +437,35 @@ class FlatStreamerEntity {
     return 0;
   }
 
+  size_t read_segment_block(const BlockLocation &block,
+                            IndexStorage::Segment *scoped, size_t off,
+                            IndexStorage::MemoryBlock &data, size_t len) const {
+    // A supplied segment stays owned by the scan until its block guards expire.
+    if (scoped) return scoped->read_borrowed(off, data, len);
+    auto owner = get_segment(block.segment_id);
+    ailego_assert_with(owner != nullptr, "Index Overflow");
+    return owner->read(off, data, len);
+  }
+
   //! Get BlockHeader of the block
   int get_block_header(const BlockLocation &block,
-                       IndexStorage::MemoryBlock &header_block) const {
+                       IndexStorage::MemoryBlock &header_block,
+                       IndexStorage::Segment *segment = nullptr) const {
     // The header is located in the end of a block to align features
-    auto segment = this->get_segment(block.segment_id);
-    ailego_assert_with(segment != nullptr, "Index Overflow");
     size_t off = this->get_block_header_offset(block.block_index);
-    if (segment->read(off, header_block, sizeof(BlockHeader)) !=
-        sizeof(BlockHeader)) {
+    if (read_segment_block(block, segment, off, header_block,
+                           sizeof(BlockHeader)) != sizeof(BlockHeader)) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
       return -1;
     }
     return 0;
   }
-  int get_block_deletion_map(
-      const BlockLocation &block,
-      IndexStorage::MemoryBlock &deletion_map_block) const {
-    auto segment = this->get_segment(block.segment_id);
-    ailego_assert_with(segment != nullptr, "Index Overflow");
+  int get_block_deletion_map(const BlockLocation &block,
+                             IndexStorage::MemoryBlock &deletion_map_block,
+                             IndexStorage::Segment *segment = nullptr) const {
     size_t off = this->get_block_deletion_map_offset(block.block_index);
-    if (segment->read(off, deletion_map_block, sizeof(DeletionMap)) !=
-        sizeof(DeletionMap)) {
+    if (read_segment_block(block, segment, off, deletion_map_block,
+                           sizeof(DeletionMap)) != sizeof(DeletionMap)) {
       LOG_ERROR("Failed to read deletion map, off=%zu", off);
       return -1;
     }
@@ -448,12 +473,11 @@ class FlatStreamerEntity {
   }
 
   int get_block_keys(const BlockLocation &block,
-                     IndexStorage::MemoryBlock &keys_block) const {
-    auto segment = this->get_segment(block.segment_id);
-    ailego_assert_with(segment != nullptr, "Index Overflow");
+                     IndexStorage::MemoryBlock &keys_block,
+                     IndexStorage::Segment *segment = nullptr) const {
     size_t off = this->get_block_key_offset(block.block_index, 0);
-    if (segment->read(off, keys_block,
-                      block_vector_count() * sizeof(uint64_t)) !=
+    if (read_segment_block(block, segment, off, keys_block,
+                           block_vector_count() * sizeof(uint64_t)) !=
         block_vector_count() * sizeof(uint64_t)) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
       return -1;
@@ -462,12 +486,28 @@ class FlatStreamerEntity {
   }
 
   int get_block_vectors(const BlockLocation &block,
-                        IndexStorage::MemoryBlock &vector_block) const {
-    auto segment = this->get_segment(block.segment_id);
-    ailego_assert_with(segment != nullptr, "Index Overflow");
+                        IndexStorage::MemoryBlock &vector_block,
+                        FlatSearchScratch *scratch = nullptr,
+                        IndexStorage::Segment *segment = nullptr) const {
     size_t off = this->get_block_vector_offset(block.block_index, 0);
-    if (segment->read(off, vector_block,
-                      block_vector_count() * index_meta_.element_size()) !=
+    const size_t size = block_vector_count() * index_meta_.element_size();
+    if (scratch && storage_->memory_block_type() ==
+                       IndexStorage::MemoryBlock::MBT_BUFFERPOOL &&
+        size > ailego::kVectorPageSize) {
+      auto &buffer = scratch->vector_buffer;
+      buffer.resize((size + sizeof(buffer[0]) - 1) / sizeof(buffer[0]));
+      auto owner = segment ? IndexStorage::Segment::Pointer()
+                           : get_segment(block.segment_id);
+      auto *source = segment ? segment : owner.get();
+      ailego_assert_with(source != nullptr, "Index Overflow");
+      if (source->fetch(off, buffer.data(), size) != size) {
+        return IndexError_ReadData;
+      }
+      vector_block = IndexStorage::MemoryBlock::MakeBorrowedView(buffer.data());
+      return 0;
+    }
+    if (read_segment_block(block, segment, off, vector_block,
+                           block_vector_count() * index_meta_.element_size()) !=
         block_vector_count() * index_meta_.element_size()) {
       LOG_ERROR("Failed to read block header, off=%zu", off);
       return -1;
@@ -475,7 +515,20 @@ class FlatStreamerEntity {
     return 0;
   }
 
+ protected:
+  bool try_bounded_distances(const void *query, const void *const *vectors,
+                             size_t count, float *distances,
+                             FlatSearchScratch *scratch,
+                             const IndexDocumentHeap *heap) const;
+
  private:
+  int search_borrowed_block(
+      const void *query, const BlockLocation &block, const BlockHeader *header,
+      const IndexFilter &filter, const DeletionMap *deletion_map,
+      IndexDocumentHeap *heap, IndexContext::Stats *context_stats,
+      FlatSearchScratch *scratch, IndexStorage::Segment *segment,
+      const uint64_t *keys) const;
+
   //! Constants
   static constexpr size_t kMaxSegmentId = std::numeric_limits<uint32_t>::max();
   static constexpr size_t kMaxBlockId = std::numeric_limits<uint32_t>::max();
@@ -489,6 +542,9 @@ class FlatStreamerEntity {
   // written by segment-cache locking in concurrent queries.
   alignas(AILEGO_CACHE_LINE_SIZE) IndexMeta index_meta_{};
   IndexStorage::Pointer storage_{};
+  // Storage owns the pool; its open/close excludes active queries.
+  ailego::VecBufferPool *borrowed_pool_{nullptr};
+  turbo::SplitDistanceQuantizer::Distance split_distance_{nullptr};
   IndexMetric::MatrixDistance row_distance_{}, column_distance_{};
   IndexMetric::MatrixBatchDistance batch_distance_{};
   std::shared_ptr<zvec::turbo::Quantizer> quantizer_{};

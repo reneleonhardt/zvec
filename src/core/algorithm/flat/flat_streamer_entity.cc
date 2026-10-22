@@ -14,6 +14,8 @@
 
 #include "flat_streamer_entity.h"
 #include <cstdint>
+#include <ailego/pattern/scope_guard.h>
+#include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/core/framework/index_error.h>
 #include "utility/legacy_read_buffer.h"
 #include "flat_utility.h"
@@ -61,9 +63,11 @@ int FlatContiguousStreamerEntity::evaluate_distances(
     }
     distances.resize(vector_ptrs.size());
     if (quantizer()) {
-      quantizer()->calc_distance_dp_query_batch(
-          vector_ptrs.data(), static_cast<int>(vector_ptrs.size()), query,
-          distances.data());
+      if (!try_bounded_distances(query, vector_ptrs.data(), vector_ptrs.size(),
+                                  distances.data(), scratch, heap))
+        quantizer()->calc_distance_dp_query_batch(
+            vector_ptrs.data(), static_cast<int>(vector_ptrs.size()), query,
+            distances.data());
     } else {
       const auto &batch_distance_func = batch_distance();
       if (batch_distance_func) {
@@ -208,12 +212,24 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
   LOG_DEBUG("Open storage %s done, metric=%s", storage_->name().c_str(),
             index_meta_.metric_name().c_str());
 
+  const auto pool = storage_->vec_buffer_pool();
+  if (pool && pool->cache_enabled() && !pool->writable() &&
+      index_meta_.element_size() <= ailego::kVectorPageSize / 4 &&
+      block_vector_count() * index_meta_.element_size() >
+          ailego::kVectorPageSize)
+    borrowed_pool_ = pool.get();
+  auto *split = dynamic_cast<const turbo::SplitDistanceQuantizer *>(
+      quantizer_.get());
+  split_distance_ = split ? split->split_distance() : nullptr;
+
   return 0;
 }
 
 int FlatStreamerEntity::close() {
   segments_.clear();
   storage_.reset();
+  borrowed_pool_ = nullptr;
+  split_distance_ = nullptr;
   key_info_map_lock_.reset();
   key_info_map_.clear();
   withid_key_info_map_.clear();
@@ -352,8 +368,11 @@ int FlatStreamerEntity::add(uint64_t key, const void *vec, size_t size) {
 int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
                                uint32_t *scan_count, IndexDocumentHeap *heap,
                                IndexContext::Stats *context_stats,
-                               FlatSearchScratch * /*scratch*/,
+                               FlatSearchScratch *scratch,
                                size_t /*batch_size*/) const {
+  FlatSearchScratch fallback;
+  if (!scratch) scratch = &fallback;
+  scratch->distances.resize(block_vector_count());
   IndexStorage::MemoryBlock head_block;
   this->get_head_block(head_block);
   const BlockLocation *bl =
@@ -364,12 +383,40 @@ int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
   }
 
   BlockLocation block = *bl;
+  // Block readers borrow one owning segment for this scan.
+  IndexStorage::Segment::Pointer segment;
+  uint32_t segment_id = 0;
 
   while (this->is_valid_block(block)) {
+    if (!segment || segment_id != block.segment_id) {
+      segment = get_segment(block.segment_id);
+      segment_id = block.segment_id;
+      if (!segment) return IndexError_ReadData;
+    }
     IndexStorage::MemoryBlock block_header_block;
-    this->get_block_header(block, block_header_block);
-    const BlockHeader *hd =
-        reinterpret_cast<const BlockHeader *>(block_header_block.data());
+    const size_t keys_offset = get_block_key_offset(block.block_index, 0);
+    const size_t header_offset = get_block_header_offset(block.block_index);
+    const size_t metadata_end = header_offset + sizeof(BlockHeader);
+    const bool shared_metadata =
+        borrowed_pool_ && keys_offset <= header_offset &&
+        (segment->data_offset() + keys_offset) / ailego::kVectorPageSize ==
+            (segment->data_offset() + metadata_end - 1) /
+                ailego::kVectorPageSize;
+    const char *metadata = nullptr;
+    const BlockHeader *hd = nullptr;
+    if (shared_metadata) {
+      // One page guard covers the keys, deletion map, and header together.
+      if (segment->read_borrowed(keys_offset, block_header_block,
+                                 metadata_end - keys_offset) !=
+          metadata_end - keys_offset)
+        return IndexError_ReadData;
+      metadata = static_cast<const char *>(block_header_block.data());
+      hd = reinterpret_cast<const BlockHeader *>(metadata + header_offset -
+                                                 keys_offset);
+    } else {
+      this->get_block_header(block, block_header_block, segment.get());
+      hd = static_cast<const BlockHeader *>(block_header_block.data());
+    }
     if (ailego_unlikely(hd == nullptr)) {
       LOG_ERROR("Failed to get block header");
       return IndexError_ReadData;
@@ -378,15 +425,28 @@ int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
     if (hd->vector_count > 0) {
       *scan_count += hd->vector_count;
       IndexStorage::MemoryBlock deletion_map_block;
-      this->get_block_deletion_map(block, deletion_map_block);
-      const DeletionMap *deletion_map =
-          reinterpret_cast<const DeletionMap *>(deletion_map_block.data());
-      if (filter.is_valid() || deletion_map->is_dirty()) {
+      const DeletionMap *deletion_map = nullptr;
+      if (shared_metadata) {
+        deletion_map = reinterpret_cast<const DeletionMap *>(
+            metadata + get_block_deletion_map_offset(block.block_index) -
+            keys_offset);
+      } else {
+        this->get_block_deletion_map(block, deletion_map_block, segment.get());
+        deletion_map =
+            static_cast<const DeletionMap *>(deletion_map_block.data());
+      }
+      if (borrowed_pool_) {
+        int ret =
+            search_borrowed_block(query, block, hd, filter, deletion_map, heap,
+                                  context_stats, scratch, segment.get(),
+                                  reinterpret_cast<const uint64_t *>(metadata));
+        if (ret != 0) return ret;
+      } else if (filter.is_valid() || deletion_map->is_dirty()) {
         this->search_block(query, block, hd, 1.0, filter, deletion_map, heap,
-                           context_stats);
+                           context_stats, scratch, segment.get());
       } else {
         *(context_stats->mutable_dist_calced_count()) += hd->vector_count;
-        this->search_block(query, block, hd, 1.0, heap);
+        this->search_block(query, block, hd, 1.0, heap, scratch, segment.get());
       }
     }
     block = hd->next;
@@ -415,19 +475,183 @@ int FlatStreamerEntity::search_by_p_keys(const void *query,
   return 0;
 }
 
+int FlatStreamerEntity::search_borrowed_block(
+    const void *query, const BlockLocation &block, const BlockHeader *header,
+    const IndexFilter &filter, const DeletionMap *deletion_map,
+    IndexDocumentHeap *heap, IndexContext::Stats *context_stats,
+    FlatSearchScratch *scratch, IndexStorage::Segment *segment,
+    const uint64_t *keys) const {
+  IndexStorage::MemoryBlock keys_block;
+  if (!keys) {
+    if (get_block_keys(block, keys_block, segment) != 0)
+      return IndexError_ReadData;
+    keys = static_cast<const uint64_t *>(keys_block.data());
+  }
+  DeletionMap keeps;
+  scratch->vector_keys.clear();
+  size_t candidate_count = 0;
+  for (size_t k = 0; k < header->vector_count; ++k) {
+    if (!deletion_map->test(k) && keys[k] != kInvalidKey &&
+        (!filter.is_valid() || !filter(keys[k]))) {
+      keeps.set(k);
+      ++candidate_count;
+    }
+  }
+  *context_stats->mutable_filtered_count() +=
+      header->vector_count - candidate_count;
+  if (candidate_count == 0) return 0;
+  auto emit_results = [&]() {
+    size_t accepted = 0;
+    for (size_t k = 0; k < header->vector_count; ++k)
+      if (keeps.test(k)) heap->emplace(keys[k], scratch->distances[accepted++]);
+  };
+
+  if (!segment) return IndexError_ReadData;
+  auto &blocks = scratch->vector_blocks;
+  auto &reads = scratch->vector_reads;
+  reads.clear();
+  const size_t stride = index_meta_.element_size();
+  const size_t offset = get_block_vector_offset(block.block_index, 0);
+  const size_t size = header->vector_count * stride;
+  if (offset > segment->data_size() || size > segment->data_size() - offset)
+    return IndexError_ReadData;
+  const size_t absolute = segment->data_offset() + offset;
+  auto &page_ids = scratch->vector_page_ids;
+  auto &pages = scratch->vector_pages;
+  const size_t first_page = absolute / ailego::kVectorPageSize;
+  const size_t last_page = (absolute + size - 1) / ailego::kVectorPageSize;
+  page_ids.resize(last_page - first_page + 1);
+  pages.resize(page_ids.size());
+  for (size_t i = 0; i < page_ids.size(); ++i) page_ids[i] = first_page + i;
+  bool resident = false;
+  // Pins cover only this block's distance calculation, including exceptions.
+  auto release = ailego::ScopeGuard::Make([&]() {
+    if (resident)
+      borrowed_pool_->release_pages(page_ids.data(), page_ids.size());
+    blocks.clear();
+  });
+  resident = borrowed_pool_->try_acquire_resident_pages(
+      page_ids.data(), page_ids.size(), pages.data());
+  auto &pointers = scratch->vector_ptrs;
+  pointers.clear();
+  if (resident && split_distance_) {
+    auto &vectors = scratch->split_vectors;
+    vectors.clear();
+    for (size_t k = 0; k < header->vector_count; ++k) {
+      if (!keeps.test(k)) continue;
+      const size_t position = absolute + k * stride;
+      const size_t page = position / ailego::kVectorPageSize - first_page;
+      const size_t in_page = position % ailego::kVectorPageSize;
+      const size_t available = ailego::kVectorPageSize - in_page;
+      vectors.push_back({pages[page] + in_page,
+                         stride > available ? pages[page + 1] : nullptr,
+                         std::min(stride, available)});
+    }
+    if (split_distance_(vectors.data(), vectors.size(), query, quantizer_->dim(),
+                        scratch->distances.data(),
+                        heap->full() && !heap->empty()
+                            ? heap->front().score()
+                            : std::numeric_limits<float>::infinity())) {
+      *context_stats->mutable_dist_calced_count() += vectors.size();
+      emit_results();
+      return 0;
+    }
+  }
+  if (resident) {
+    const size_t aligned_stride = ailego_align(stride, AILEGO_CACHE_LINE_SIZE);
+    auto &buffer = scratch->vector_buffer;
+    const size_t lines = page_ids.size() * aligned_stride / sizeof(buffer[0]);
+    size_t spilled = 0;
+    for (size_t k = 0; k < header->vector_count; ++k) {
+      if (!keeps.test(k)) continue;
+      const size_t position = absolute + k * stride;
+      const size_t page = position / ailego::kVectorPageSize - first_page;
+      const size_t in_page = position % ailego::kVectorPageSize;
+      const size_t available = ailego::kVectorPageSize - in_page;
+      if (stride <= available) {
+        pointers.push_back(pages[page] + in_page);
+      } else {
+        if (buffer.size() < lines) buffer.resize(lines);
+        auto *spill = reinterpret_cast<char *>(buffer.data()) + spilled;
+        std::memcpy(spill, pages[page] + in_page, available);
+        std::memcpy(spill + available, pages[page + 1], stride - available);
+        pointers.push_back(spill);
+        spilled += aligned_stride;
+      }
+    }
+  } else {
+    blocks.resize(header->vector_count);
+    for (size_t first = 0; first < header->vector_count;) {
+      if (!keeps.test(first)) {
+        ++first;
+        continue;
+      }
+      const size_t available =
+          ailego::kVectorPageSize -
+          (absolute + first * stride) % ailego::kVectorPageSize;
+      const size_t limit = std::max<size_t>(1, available / stride);
+      size_t end = first + 1;
+      while (end < header->vector_count && end - first < limit &&
+             keeps.test(end))
+        ++end;
+      reads.emplace_back(segment, offset + first * stride,
+                         (end - first) * stride, &blocks[reads.size()]);
+      first = end;
+    }
+    if (!segment->read_borrowed_batch(reads.data(), reads.size()))
+      return IndexError_ReadData;
+    for (size_t i = 0; i < reads.size(); ++i) {
+      const auto *data = static_cast<const char *>(blocks[i].data());
+      for (size_t off = 0; off < reads[i].length; off += stride)
+        pointers.push_back(data + off);
+    }
+  }
+  auto *distances = scratch->distances.data();
+  if (quantizer_) {
+    if (!try_bounded_distances(query, pointers.data(), pointers.size(), distances,
+                                scratch, heap))
+      quantizer_->calc_distance_dp_query_batch(
+          pointers.data(), static_cast<int>(pointers.size()), query, distances);
+  } else {
+    for (size_t i = 0; i < pointers.size(); ++i)
+      row_major_distance(query, pointers[i], 1, distances + i);
+  }
+  *context_stats->mutable_dist_calced_count() += pointers.size();
+  emit_results();
+  return 0;
+}
+
+bool FlatStreamerEntity::try_bounded_distances(
+    const void *query, const void *const *vectors, size_t count, float *distances,
+    FlatSearchScratch *scratch, const IndexDocumentHeap *heap) const {
+  if (!split_distance_ || !scratch || count < 4 ||
+      index_meta_.dimension() <= 64 || !heap->full() || heap->empty())
+    return false;
+  auto &spans = scratch->split_vectors;
+  spans.clear();
+  spans.reserve(count);
+  for (size_t i = 0; i < count; ++i)
+    spans.push_back({vectors[i], nullptr, index_meta_.element_size()});
+  return split_distance_(spans.data(), count, query, quantizer_->dim(), distances,
+                         heap->front().score());
+}
+
 //! Search in a block
 void FlatStreamerEntity::search_block(const void *query,
                                       const BlockLocation &bl,
                                       const BlockHeader *hd, float norm_val,
-                                      IndexDocumentHeap *heap) const {
-  std::vector<float> distances(block_vector_count());
+                                      IndexDocumentHeap *heap,
+                                      FlatSearchScratch *scratch,
+                                      IndexStorage::Segment *segment) const {
+  auto *distances = scratch->distances.data();
   IndexStorage::MemoryBlock vecs_block;
-  this->get_block_vectors(bl, vecs_block);
+  this->get_block_vectors(bl, vecs_block, scratch, segment);
   const char *vecs = reinterpret_cast<const char *>(vecs_block.data());
   IndexStorage::MemoryBlock keys_block;
-  this->get_block_keys(bl, keys_block);
+  this->get_block_keys(bl, keys_block, segment);
   const uint64_t *keys = reinterpret_cast<const uint64_t *>(keys_block.data());
-  row_major_distance(query, vecs, hd->vector_count, distances.data());
+  row_major_distance(query, vecs, hd->vector_count, distances, scratch,
+                     norm_val == 1.0f ? heap : nullptr);
   for (size_t k = 0; k < hd->vector_count; ++k) {
     if (keys[k] != kInvalidKey) {
       heap->emplace(keys[k], distances[k] * norm_val);
@@ -439,14 +663,14 @@ void FlatStreamerEntity::search_block(const void *query,
 void FlatStreamerEntity::search_block(
     const void *query, const BlockLocation &bl, const BlockHeader *hd,
     float norm_val, const IndexFilter &filter, const DeletionMap *deletion_map,
-    IndexDocumentHeap *heap, IndexContext::Stats *context_stats) const {
-  std::vector<float> distances(block_vector_count());
-
+    IndexDocumentHeap *heap, IndexContext::Stats *context_stats,
+    FlatSearchScratch *scratch, IndexStorage::Segment *segment) const {
+  auto *distances = scratch->distances.data();
   IndexStorage::MemoryBlock vecs_block;
-  this->get_block_vectors(bl, vecs_block);
+  this->get_block_vectors(bl, vecs_block, scratch, segment);
   const char *vecs = reinterpret_cast<const char *>(vecs_block.data());
   IndexStorage::MemoryBlock keys_block;
-  this->get_block_keys(bl, keys_block);
+  this->get_block_keys(bl, keys_block, segment);
   const uint64_t *keys = reinterpret_cast<const uint64_t *>(keys_block.data());
 
   DeletionMap keeps;
@@ -462,10 +686,35 @@ void FlatStreamerEntity::search_block(
     (*context_stats->mutable_filtered_count()) += hd->vector_count;
     return;
   }
+  if (quantizer_) {
+    auto &pointers = scratch->vector_ptrs;
+    pointers.clear();
+    pointers.reserve(hd->vector_count);
+    for (size_t k = 0; k < hd->vector_count; ++k) {
+      if (keeps.test(k)) {
+        pointers.push_back(vecs + index_meta_.element_size() * k);
+      }
+    }
+    if (norm_val != 1.0f ||
+        !try_bounded_distances(query, pointers.data(), pointers.size(), distances,
+                                scratch, heap))
+      quantizer_->calc_distance_dp_query_batch(
+          pointers.data(), static_cast<int>(pointers.size()), query, distances);
+    *context_stats->mutable_dist_calced_count() += pointers.size();
+    *context_stats->mutable_filtered_count() +=
+        hd->vector_count - pointers.size();
+    size_t accepted = 0;
+    for (size_t k = 0; k < hd->vector_count; ++k) {
+      if (keeps.test(k)) {
+        heap->emplace(keys[k], distances[accepted++] * norm_val);
+      }
+    }
+    return;
+  }
   for (size_t k = 0; k < hd->vector_count; ++k) {
     if (keeps.test(k)) {
       auto cur_vec = vecs + index_meta_.element_size() * k;
-      row_major_distance(query, cur_vec, 1, distances.data() + k);
+      row_major_distance(query, cur_vec, 1, distances + k);
       ++(*context_stats->mutable_dist_calced_count());
     }
   }
@@ -506,6 +755,8 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone() const {
   }
   entity->index_meta_ = this->index_meta_;
   entity->storage_ = this->storage_;
+  entity->borrowed_pool_ = this->borrowed_pool_;
+  entity->split_distance_ = this->split_distance_;
   // entity->reformer_ = this->reformer_;
   entity->segments_ = std::move(segments);
   entity->meta_ = this->meta_;

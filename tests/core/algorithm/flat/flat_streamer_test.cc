@@ -25,6 +25,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <ailego/utility/math_helper.h>
 #include <ailego/utility/memory_helper.h>
 #include <gtest/gtest.h>
@@ -155,6 +156,278 @@ void FlatStreamerTest::SetUp() {
 
 void FlatStreamerTest::TearDown() {
   zvec::test_util::RemoveTestPath(dir_);
+}
+
+TEST_F(FlatStreamerTest, BlockSearchReusesDistanceScratchAcrossFilters) {
+  IndexMeta meta(IndexMeta::DT_FP32, 8);
+  meta.set_metric("SquaredEuclidean", 0, Params());
+  IndexQueryMeta qmeta(IndexMeta::DT_FP32, 8);
+  auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+  ASSERT_EQ(0, storage->init(Params()));
+  ASSERT_EQ(0, storage->open(dir_ + "block_scratch", true));
+  auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
+  ASSERT_EQ(0, streamer->init(meta, Params()));
+  ASSERT_EQ(0, streamer->open(storage));
+  auto context = streamer->create_context();
+  for (uint32_t id = 0; id < 65; ++id) {
+    const std::vector<float> vector(8, float(id));
+    ASSERT_EQ(0, streamer->add_with_id_impl(id, vector.data(), qmeta, context));
+  }
+  context->set_topk(5);
+  auto *scratch =
+      static_cast<FlatStreamerContext<32> *>(context.get())->search_scratch();
+  const float *distances = nullptr;
+  const std::vector<float> query(8, 52.0f);
+  for (int mode : {0, 1, 2, 0}) {
+    if (mode == 0) {
+      context->reset_filter();
+    } else {
+      IndexFilter filter;
+      filter.set([mode](uint64_t id) { return mode == 2 || id % 2 == 0; });
+      context->set_filter(std::move(filter));
+    }
+    ASSERT_EQ(0, streamer->search_bf_impl(query.data(), qmeta, context));
+    ASSERT_EQ(mode == 2 ? 0U : 5U, context->result().size());
+    ASSERT_EQ(32U, scratch->distances.size());
+    if (distances) EXPECT_EQ(distances, scratch->distances.data());
+    distances = scratch->distances.data();
+    if (mode != 2) {
+      EXPECT_FLOAT_EQ(mode == 0 ? 0.0f : 8.0f,
+                      context->result().front().score());
+    }
+  }
+  ASSERT_EQ(0, streamer->close());
+}
+
+TEST_F(FlatStreamerTest, ReuseLargeBufferPoolVectorSnapshots) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const auto capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto cleanup = ScopeGuard::Make([&]() { EXPECT_EQ(0, pool.init(capacity)); });
+  const size_t dimension = kVectorPageSize / (32 * sizeof(float)) + 1;
+  IndexMeta meta(IndexMeta::DT_FP32, dimension);
+  meta.set_metric("SquaredEuclidean", 0, Params());
+  IndexQueryMeta qmeta(IndexMeta::DT_FP32, dimension);
+  auto storage = IndexFactory::CreateStorage("BufferStorage");
+  ASSERT_EQ(0, storage->init(Params()));
+  ASSERT_EQ(0, storage->open(dir_ + "vector_snapshots", true));
+  auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
+  ASSERT_EQ(0, streamer->init(meta, Params()));
+  ASSERT_EQ(0, streamer->open(storage));
+  auto context = streamer->create_context();
+  for (uint32_t id = 0; id < 65; ++id) {
+    const std::vector<float> row(dimension, float(id));
+    ASSERT_EQ(0, streamer->add_with_id_impl(id, row.data(), qmeta, context));
+  }
+  context->set_topk(3);
+  auto *scratch =
+      static_cast<FlatStreamerContext<32> *>(context.get())->search_scratch();
+  const void *previous = nullptr;
+  const std::vector<float> query(dimension, 52.25f);
+  for (int mode : {0, 1, 2, 0}) {
+    context->reset_filter();
+    if (mode) {
+      IndexFilter filter;
+      filter.set([mode](uint64_t id) { return mode == 2 || id % 2 == 0; });
+      context->set_filter(std::move(filter));
+    }
+    ASSERT_EQ(0, streamer->search_bf_impl(query.data(), qmeta, context));
+    ASSERT_EQ(mode == 2 ? 0U : 3U, context->result().size());
+    ASSERT_NE(nullptr, scratch->vector_buffer.data());
+    EXPECT_EQ(0U, reinterpret_cast<uintptr_t>(scratch->vector_buffer.data()) %
+                      AILEGO_CACHE_LINE_SIZE);
+    if (previous) EXPECT_EQ(previous, scratch->vector_buffer.data());
+    previous = scratch->vector_buffer.data();
+    if (mode != 2) {
+      EXPECT_FLOAT_EQ(float(dimension) * (mode == 0 ? .0625f : .5625f),
+                      context->result().front().score());
+    }
+  }
+  ASSERT_EQ(0, streamer->close());
+}
+
+TEST_F(FlatStreamerTest, ReadOnlyBufferPoolBorrowsVectorRuns) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const auto capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto cleanup = ScopeGuard::Make([&]() { EXPECT_EQ(0, pool.init(capacity)); });
+  for (int format : {0, 1, 2, 3, 4}) {
+    const size_t dimension = format == 2 || format == 4 ? 768 : 769;
+    const char *quantizer_name = format == 0   ? nullptr
+                                : format == 1 || format == 4 ? "Fp16Quantizer"
+                                              : "Fp32Quantizer";
+    ASSERT_EQ(0, pool.init(64UL << 20));
+    IndexMeta meta(IndexMeta::DT_FP32, dimension);
+    meta.set_metric("SquaredEuclidean", 0, Params());
+    auto quantizer = quantizer_name
+                         ? IndexFactory::CreateQuantizer(quantizer_name)
+                         : nullptr;
+    if (quantizer) {
+      ASSERT_EQ(0, quantizer->init(meta, Params()));
+      meta = quantizer->meta();
+      meta.set_quantizer(quantizer_name, 0, Params());
+    }
+    IndexQueryMeta raw_qmeta(IndexMeta::DT_FP32, dimension), qmeta = raw_qmeta;
+    const std::vector<float> query(dimension, 51.25f);
+    std::string query_code;
+    if (quantizer)
+      ASSERT_EQ(
+          0, quantizer->quantize(query.data(), raw_qmeta, &query_code, &qmeta));
+    const auto path = dir_ + "borrow_" + std::to_string(format);
+    auto storage = IndexFactory::CreateStorage("BufferStorage");
+    ASSERT_EQ(0, storage->init(Params()));
+    auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
+    ASSERT_EQ(0, streamer->init(meta, Params(), quantizer));
+    ASSERT_EQ(0, storage->open(path, true));
+    ASSERT_EQ(0, streamer->open(storage));
+    auto context = streamer->create_context();
+    for (uint32_t id = 0; id < 65; ++id) {
+      if (id == 63) continue;
+      const std::vector<float> row(dimension, float(id));
+      std::string code(meta.element_size(), '\0');
+      if (quantizer)
+        quantizer->quantize_data(row.data(), code.data());
+      else
+        std::memcpy(code.data(), row.data(), code.size());
+      ASSERT_EQ(0, streamer->add_with_id_impl(id, code.data(), qmeta, context));
+    }
+    ASSERT_EQ(0, streamer->flush(0));
+    context.reset();
+    ASSERT_EQ(0, streamer->close());
+    ASSERT_EQ(0, storage->close());
+    for (size_t budget : {64UL << 20, 1UL}) {
+      ASSERT_EQ(0, pool.init(budget));
+      ASSERT_EQ(0, storage->open(path, false));
+      ASSERT_EQ(0, streamer->open(storage));
+      const bool borrowed = storage->vec_buffer_pool()->cache_enabled();
+      context = streamer->create_context();
+      context->set_topk(3);
+      auto *scratch = static_cast<FlatStreamerContext<32> *>(context.get())
+                          ->search_scratch();
+      if (borrowed) {
+        context->set_filter([](uint64_t id) { return id % 2 == 0; });
+        ASSERT_EQ(0, streamer->search_bf_impl(
+                         quantizer ? static_cast<const void *>(query_code.data())
+                                   : query.data(), qmeta, context));
+        ASSERT_EQ(3U, context->result().size());
+        EXPECT_EQ(51U, context->result()[0].key());
+        // Warm the vectors before checking the resident staging buffer.
+        scratch->vector_buffer.clear();
+      }
+      for (int mode : {0, 1, 2, 3, 0}) {
+        auto excluded = [mode](uint64_t id) {
+          return mode == 1   ? id % 2 == 0
+                 : mode == 2 ? true
+                             : mode == 3 && id != 64;
+        };
+        context->reset_filter();
+        if (mode) context->set_filter(excluded);
+        ASSERT_EQ(0,
+                  streamer->search_bf_impl(
+                      quantizer ? static_cast<const void *>(query_code.data())
+                                : query.data(),
+                      qmeta, context));
+        std::vector<std::pair<float, uint64_t>> expected;
+        for (uint64_t id = 0; id < 65; ++id)
+          if (id != 63 && !excluded(id))
+            expected.emplace_back(
+                float(dimension) * std::pow(float(id) - 51.25f, 2), id);
+        std::sort(expected.begin(), expected.end());
+        ASSERT_EQ(std::min<size_t>(3, expected.size()),
+                  context->result().size());
+        auto *stats = static_cast<FlatStreamerContext<32> *>(context.get())
+                          ->mutable_stats();
+        EXPECT_EQ(borrowed || mode ? expected.size() : 65,
+                  stats->dist_calced_count());
+        EXPECT_EQ(borrowed || mode ? 65 - expected.size() : 0,
+                  stats->filtered_count());
+        for (size_t i = 0; i < context->result().size(); ++i) {
+          EXPECT_EQ(expected[i].second, context->result()[i].key());
+          EXPECT_FLOAT_EQ(expected[i].first, context->result()[i].score());
+        }
+        if (borrowed) {
+          EXPECT_LT(
+              scratch->vector_buffer.size() * sizeof(scratch->vector_buffer[0]),
+              32 * meta.element_size());
+          EXPECT_GT(scratch->vector_page_ids.capacity(), 0U);
+#if defined(AILEGO_ARM64_NEON)
+          if (format == 2) EXPECT_TRUE(scratch->vector_buffer.empty());
+#endif
+        } else {
+          EXPECT_GE(
+              scratch->vector_buffer.size() * sizeof(scratch->vector_buffer[0]),
+              32 * meta.element_size());
+        }
+        EXPECT_TRUE(scratch->vector_blocks.empty());
+      }
+      std::weak_ptr<VecBufferPool> backing_pool = storage->vec_buffer_pool();
+      ASSERT_EQ(0, streamer->close());
+      ASSERT_EQ(0, storage->close());
+      EXPECT_TRUE(backing_pool.expired());
+      context.reset();
+    }
+  }
+}
+
+TEST_F(FlatStreamerTest, FilteredQuantizerBatchesMatchScalarDistances) {
+  for (const auto &[name, dimension] :
+       {std::pair{"Fp32Quantizer", 17U}, std::pair{"Fp16Quantizer", 17U},
+        std::pair{"Fp32Quantizer", 80U}, std::pair{"Fp16Quantizer", 80U}}) {
+    SCOPED_TRACE(name);
+    IndexMeta raw_meta(IndexMeta::DT_FP32, dimension);
+    raw_meta.set_metric("SquaredEuclidean", 0, Params());
+    auto quantizer = IndexFactory::CreateQuantizer(name);
+    ASSERT_EQ(0, quantizer->init(raw_meta, Params()));
+    IndexMeta meta = quantizer->meta();
+    meta.set_quantizer(name, 0, Params());
+    auto streamer = IndexFactory::CreateStreamer("FlatStreamer");
+    ASSERT_EQ(0, streamer->init(meta, Params(), quantizer));
+    auto storage = IndexFactory::CreateStorage("MMapFileStorage");
+    ASSERT_EQ(0, storage->init(Params()));
+    ASSERT_EQ(0, storage->open(dir_ + name + std::to_string(dimension), true));
+    ASSERT_EQ(0, streamer->open(storage));
+    auto context = streamer->create_context();
+    context->set_topk(5);
+    const std::vector<float> query(dimension, .123f);
+    std::string query_code;
+    IndexQueryMeta raw_qmeta(IndexMeta::DT_FP32, dimension), qmeta;
+    ASSERT_EQ(
+        0, quantizer->quantize(query.data(), raw_qmeta, &query_code, &qmeta));
+    std::vector<std::string> codes(65);
+    for (size_t id = 0; id < codes.size(); ++id) {
+      std::vector<float> row(dimension);
+      for (size_t d = 0; d < dimension; ++d)
+        row[d] = float((id * 37 % codes.size()) * 17 + d) * .0031f;
+      codes[id].resize(quantizer->quantized_datapoint_vector_length());
+      quantizer->quantize_data(row.data(), codes[id].data());
+      ASSERT_EQ(0, streamer->add_impl(id, codes[id].data(), qmeta, context));
+    }
+    for (int mode : {0, 1, 2, 3, 0}) {
+      auto excluded = [mode](uint64_t id) {
+        return mode == 1   ? id % 2 == 0
+               : mode == 2 ? true
+                           : mode == 3 && id != 7;
+      };
+      context->reset_filter();
+      if (mode) context->set_filter(excluded);
+      ASSERT_EQ(0, streamer->search_bf_impl(query_code.data(), qmeta, context));
+      std::vector<std::pair<float, uint64_t>> expected;
+      for (size_t id = 0; id < codes.size(); ++id) {
+        if (!excluded(id))
+          expected.emplace_back(quantizer->calc_distance_dp_query(
+                                    codes[id].data(), query_code.data()),
+                                id);
+      }
+      std::sort(expected.begin(), expected.end());
+      ASSERT_EQ(std::min<size_t>(5, expected.size()), context->result().size());
+      for (size_t i = 0; i < context->result().size(); ++i) {
+        EXPECT_EQ(expected[i].second, context->result()[i].key());
+        const float actual = context->result()[i].score();
+        EXPECT_EQ(0, std::memcmp(&expected[i].first, &actual, sizeof(float)));
+      }
+    }
+    ASSERT_EQ(0, streamer->close());
+  }
 }
 
 TEST_F(FlatStreamerTest, TestAddVector) {
@@ -1371,6 +1644,28 @@ TEST_F(FlatStreamerTest, TestConcurrentSegmentGrowthAndFetch) {
         ASSERT_FLOAT_EQ(static_cast<float>(key), data[d]);
       }
     }
+    readers.clear();
+    for (unsigned reader = 0; reader < 3; ++reader) {
+      readers.push_back(std::async(std::launch::async, [&]() {
+        FlatSearchScratch scratch;
+        for (uint32_t round = 0; round < 16; ++round) {
+          const uint32_t target = round * 142;
+          const std::vector<float> query(dim, float(target));
+          IndexDocumentHeap heap(1);
+          IndexContext::Stats context_stats;
+          IndexFilter filter;
+          if (round % 2) filter.set([](uint64_t id) { return id % 2; });
+          uint32_t scanned = 0;
+          if (entity.search(query.data(), filter, &scanned, &heap,
+                              &context_stats, &scratch, 32) != 0 ||
+              scanned != count || heap.size() != 1 ||
+              heap.front().key() != target || heap.front().score() != 0)
+            return false;
+        }
+        return true;
+      }));
+    }
+    for (auto &reader : readers) EXPECT_TRUE(reader.get());
     ASSERT_EQ(0, entity.flush(0));
     ASSERT_EQ(0, entity.close());
     ASSERT_EQ(0, storage->close());
@@ -2184,6 +2479,7 @@ TEST_F(FlatStreamerTest, TestTurboQuantizerAddAndSearch) {
       v = dist(gen);
     }
   }
+  const void *const *batch_pointers = nullptr;
   for (const auto &query : queries) {
     IndexQueryMeta raw_qmeta(IndexMeta::DT_FP32, raw_dim);
     std::string quantized;
@@ -2191,6 +2487,11 @@ TEST_F(FlatStreamerTest, TestTurboQuantizerAddAndSearch) {
     ASSERT_EQ(0, quantizer->quantize(query.data(), raw_qmeta, &quantized,
                                      &turbo_qmeta));
     ASSERT_EQ(0, streamer->search_impl(quantized.data(), turbo_qmeta, context));
+    auto *scratch =
+        static_cast<FlatStreamerContext<32> *>(context.get())->search_scratch();
+    ASSERT_GE(scratch->vector_ptrs.capacity(), 32U);
+    if (batch_pointers) EXPECT_EQ(batch_pointers, scratch->vector_ptrs.data());
+    batch_pointers = scratch->vector_ptrs.data();
 
     // Reference topk with the quantizer scalar distance
     std::vector<std::pair<float, uint64_t>> ref(doc_count);
@@ -2210,7 +2511,7 @@ TEST_F(FlatStreamerTest, TestTurboQuantizerAddAndSearch) {
     }
   }
 
-  // Filtered search goes through the scalar quantizer path
+  // Filtered search must agree with scalar reference distances.
   {
     context->set_filter([](uint64_t key) { return (key % 2 == 0); });
     const auto &query = queries[0];

@@ -848,7 +848,8 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
 
   IndexStorage::MemoryBlock data;
   const size_t block_vecs = header_.block_vector_count;
-  std::vector<float> distances(block_vecs);
+  auto &distances = distances_;
+  distances.resize(block_vecs);
   const size_t batch_size = kBatchBlocks;
   const size_t block_size = header_.block_size;
   const size_t element_size = meta_.element_size();
@@ -972,7 +973,8 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
 
   IndexStorage::MemoryBlock data;
   const size_t block_vecs = header_.block_vector_count;
-  std::vector<float> distances(block_vecs);
+  auto &distances = distances_;
+  distances.resize(block_vecs);
   const size_t batch_size = kBatchBlocks;
   const size_t block_size = header_.block_size;
   const size_t element_size = meta_.element_size();

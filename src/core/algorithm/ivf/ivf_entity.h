@@ -412,6 +412,7 @@ class IVFEntity {
   mutable std::string vector_{};  // temporary buffer for colomn major order
   //! Temporary buffer for one row-major vector split across storage pages.
   mutable std::vector<uint8_t> scatter_vector_{};
+  mutable std::vector<float> distances_{};
   float norm_value_{0.0f};  // normalize the inverted vector to orignal score
   bool norm_value_sqrt_{false};  // does the norm value need to sqrt
   InvertedIndexHeader header_;
