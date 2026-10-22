@@ -1622,6 +1622,12 @@ TEST_F(FlatStreamerTest, TestConcurrentSegmentGrowthAndFetch) {
     std::vector<float> vec(dim, 0.0f);
     ASSERT_EQ(0, entity.add(0, vec.data(), vec.size() * sizeof(float)));
 
+    ASSERT_EQ(0, entity.flush(0));
+    ASSERT_EQ(0, entity.close());
+    ASSERT_EQ(0, storage->close());
+    ASSERT_EQ(0, storage->open(dir_ + storage_name, true));
+    ASSERT_EQ(0, entity.open(storage, *index_meta_ptr_));
+
     std::atomic<uint32_t> published{0};
     std::atomic<unsigned> ready{0};
     std::atomic<bool> start{false};

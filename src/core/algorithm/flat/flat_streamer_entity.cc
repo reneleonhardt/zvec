@@ -153,7 +153,7 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
   // segments_[0] store the meta information of the linear list
   ailego_assert_with(segments_.size() == 0, "Invalid Size");
 
-  key_info_map_lock_ = std::make_shared<ailego::SharedMutex>();
+  key_info_map_lock_ = std::make_shared<KeyMapMutex>();
   key_info_map_.clear();
   id_key_vector_.clear();
   withid_key_info_map_.clear();
@@ -224,6 +224,7 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
   auto *split = dynamic_cast<const turbo::SplitDistanceQuantizer *>(
       quantizer_.get());
   split_distance_ = split ? split->split_distance() : nullptr;
+  opened_segments_ = segments_;
 #if defined(__APPLE__)
   mmap_prefault_state_.store(storage_->name() == "MMapFileStorage"
                                  ? MmapPrefaultState::Unprobed
@@ -235,6 +236,7 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
 }
 
 int FlatStreamerEntity::close() {
+  opened_segments_.clear();
   segments_.clear();
   storage_.reset();
   borrowed_pool_ = nullptr;
@@ -831,6 +833,7 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone() const {
 #endif
   // entity->reformer_ = this->reformer_;
   entity->segments_ = std::move(segments);
+  entity->opened_segments_ = entity->segments_;
   entity->meta_ = this->meta_;
   entity->quantizer_ = this->quantizer_;
   entity->key_info_map_lock_ = this->key_info_map_lock_;

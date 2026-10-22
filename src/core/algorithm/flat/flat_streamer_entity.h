@@ -19,6 +19,10 @@
 #include <mutex>
 #include <unordered_map>
 #include <vector>
+#if defined(__APPLE__)
+#include <pthread.h>
+#include <system_error>
+#endif
 #include <ailego/parallel/lock.h>
 #include <ailego/utility/memory_helper.h>
 #include <turbo/quantizer/quantizer.h>
@@ -326,6 +330,7 @@ class FlatStreamerEntity {
 
   //! Retrive storage segment by index
   IndexStorage::Segment::Pointer get_segment(size_t index) const {
+    if (index < opened_segments_.size()) return opened_segments_[index];
     // Copy the shared_ptr before unlocking: append may reallocate the cache.
     // Readers can also mutate the cache through the lazy fill below.
     std::lock_guard<std::mutex> lock(segments_mutex_);
@@ -557,8 +562,33 @@ class FlatStreamerEntity {
   IndexMetric::DistanceBatchQueryPreprocessFunc batch_query_preprocess_{};
   size_t extra_values_size_{0};
   mutable std::vector<IndexStorage::Segment::Pointer> segments_{};
+  // Stable handles published by open/clone; later appends use the locked cache.
+  std::vector<IndexStorage::Segment::Pointer> opened_segments_{};
   IndexStreamer::Stats &stats_;
-  mutable std::shared_ptr<ailego::SharedMutex> key_info_map_lock_{};
+#if defined(__APPLE__)
+  // libc++ serializes shared-lock bookkeeping; these short lookups use the
+  // native reader/writer lock while retaining exclusion for map growth.
+  class KeyMapMutex {
+   public:
+    KeyMapMutex() = default;
+    KeyMapMutex(const KeyMapMutex &) = delete;
+    KeyMapMutex &operator=(const KeyMapMutex &) = delete;
+    ~KeyMapMutex() { pthread_rwlock_destroy(&mutex_); }
+    void lock() { check(pthread_rwlock_wrlock(&mutex_)); }
+    void unlock() { pthread_rwlock_unlock(&mutex_); }
+    void lock_shared() { check(pthread_rwlock_rdlock(&mutex_)); }
+    void unlock_shared() { pthread_rwlock_unlock(&mutex_); }
+
+   private:
+    static void check(int error) {
+      if (error) throw std::system_error(error, std::generic_category());
+    }
+    pthread_rwlock_t mutex_ = PTHREAD_RWLOCK_INITIALIZER;
+  };
+#else
+  using KeyMapMutex = ailego::SharedMutex;
+#endif
+  mutable std::shared_ptr<KeyMapMutex> key_info_map_lock_{};
   std::unordered_map<uint64_t, VectorLocation> key_info_map_{};
   std::vector<VectorLocation> withid_key_info_map_{};
   std::vector<uint32_t> withid_key_map_{};
