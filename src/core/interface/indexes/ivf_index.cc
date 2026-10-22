@@ -253,12 +253,15 @@ int IVFIndex::add(const VectorData &vector, uint32_t doc_id) {
       input_vector_meta_.dimension() * input_vector_meta_.unit_size());
 
   std::lock_guard<std::mutex> lock(mutex_);
-  while (doc_cache_.size() <= doc_id) {
-    std::string fake_data(
-        input_vector_meta_.dimension() * input_vector_meta_.unit_size(), 0);
-    doc_cache_.push_back(std::make_pair(kInvalidKey, fake_data));
+  while (doc_cache_.size() < doc_id) {
+    doc_cache_.emplace_back(kInvalidKey,
+                            std::string(out_vector_buffer.size(), '\0'));
   }
-  doc_cache_[doc_id] = std::make_pair(doc_id, out_vector_buffer);
+  if (doc_cache_.size() == doc_id) {
+    doc_cache_.emplace_back(doc_id, std::move(out_vector_buffer));
+  } else {
+    doc_cache_[doc_id] = std::make_pair(doc_id, std::move(out_vector_buffer));
+  }
   return 0;
 }
 

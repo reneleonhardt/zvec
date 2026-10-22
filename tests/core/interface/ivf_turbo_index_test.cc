@@ -197,6 +197,26 @@ TEST_P(IVFTurboIndexTest, AddTrainSearchFetchAndReopenWithDefaultQuantizer) {
   ASSERT_EQ(0, reopened->close());
 }
 
+TEST_P(IVFTurboIndexTest, CollectedRowsOwnInputsAcrossGapsAndUpdates) {
+  auto index =
+      IndexFactory::CreateAndInitIndex(*param(std::get<0>(GetParam())));
+  ASSERT_NE(nullptr, index);
+  ASSERT_EQ(0, index->open(path_, {StorageOptions::StorageType::kMMAP, true}));
+  std::vector<float> row(kDimension, 99.f);
+  ASSERT_EQ(0, index->add(VectorData{DenseVector{row.data()}}, 0));
+  for (uint32_t parity : {1U, 0U}) {
+    for (uint32_t id = parity; id < kCount; id += 2) {
+      row = vectors_[id];
+      ASSERT_EQ(0, index->add(VectorData{DenseVector{row.data()}}, id));
+      std::fill(row.begin(), row.end(), 99.f);
+    }
+  }
+  ASSERT_EQ(0, index->train());
+  EXPECT_EQ(kCount, index->get_doc_count());
+  check_search_and_fetch(index.get());
+  ASSERT_EQ(0, index->close());
+}
+
 TEST_P(IVFTurboIndexTest, MergeDecodesSourceVectorsBeforeRebuilding) {
   auto source =
       IndexFactory::CreateAndInitIndex(*param(std::get<0>(GetParam())));
