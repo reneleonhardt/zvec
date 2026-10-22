@@ -1,0 +1,93 @@
+name: Vector performance experiment
+on:
+  push:
+    branches: [perf/reduce-allocations]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: vector-perf-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  benchmark:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 180
+    env:
+      BASELINE_SHA: 8d4996924bce78f8b072a353803c305101bcc807
+      BEFORE_SHA: 68a7b9eb563d2bf413bdb0b3abb3a7d1f301fea0
+      CCACHE_BASEDIR: ${{ github.workspace }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
+      CCACHE_MAXSIZE: 3G
+    steps:
+      - name: Install benchmark build tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache python3 git ca-certificates zstd libaio-dev liburing-dev libzstd-dev linux-tools-common linux-tools-generic
+          mkdir -p results
+          lscpu > results/cpu.txt
+          uname -a > results/kernel.txt
+          cat /etc/os-release > results/os-release.txt
+          c++ --version > results/compiler.txt
+          cmake --version > results/cmake.txt
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+          path: candidate
+      - uses: actions/cache@v6
+        with:
+          path: .ccache-vector-perf
+          key: vector-perf-2604-gcc-${{ runner.arch }}-${{ github.sha }}
+          restore-keys: vector-perf-2604-gcc-${{ runner.arch }}-
+      - name: Build frozen main and both candidates
+        run: |
+          set -euo pipefail
+          cp -a candidate/.github/benchmarks/vector-perf benchmark-harness
+          git -C candidate fetch --depth=1 origin "$BASELINE_SHA" "$BEFORE_SHA"
+          for pair in "main:$BASELINE_SHA" "before:$BEFORE_SHA" "candidate:$GITHUB_SHA"; do
+            label=${pair%%:*}
+            revision=${pair#*:}
+            git -C candidate checkout --detach "$revision"
+            git -C candidate submodule update --init --recursive
+            test "$(git -C candidate rev-parse HEAD)" = "$revision"
+            nice -n 10 cmake -S benchmark-harness -B bench-build -G Ninja \
+              -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE/candidate" -DCMAKE_BUILD_TYPE=Release \
+              -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+            nice -n 10 cmake --build bench-build --target vector_system_search vector_pool_workloads vector_alloc_probe --parallel 4
+            mkdir "bench-$label"
+            cp bench-build/vector_system_search bench-build/vector_pool_workloads bench-build/libvector_alloc_probe.so "bench-$label/"
+            ldd "bench-$label/vector_system_search" > "results/$label-libraries.txt"
+            if grep -q '/bench-build/' "results/$label-libraries.txt"; then
+              echo "Unexpected mutable runtime library dependency" >&2
+              exit 1
+            fi
+          done
+      - name: Paired CPU allocation and wall-time benchmarks
+        run: |
+          set -euo pipefail
+          python3 benchmark-harness/run.py bench-main bench-before bench-candidate results | tee results/paired.log
+      - name: Profile remaining IVF search and training costs
+        if: success()
+        run: |
+          set -euo pipefail
+          perf_bin=$(find /usr/lib/linux-tools -type f -name perf | sort | head -n 1)
+          sudo sysctl -w kernel.perf_event_paranoid=1
+          profile_arch=auto
+          if [[ -d results/avx2 ]]; then profile_arch=avx2; fi
+          export VECTOR_PERF_ARCH="$profile_arch"
+          "$perf_bin" record -e cycles:u -g --call-graph dwarf -o results/ivf-search.perf -- \
+            bench-candidate/vector_system_search warm "$GITHUB_WORKSPACE/results/$profile_arch" ivf bufferpool 0 4 8 1 > results/profile-search.csv 2> results/profile-search.log
+          "$perf_bin" report -i results/ivf-search.perf --stdio > results/ivf-search-profile.txt
+          "$perf_bin" record -e cycles:u -g --call-graph dwarf -o results/ivf-write.perf -- \
+            bench-candidate/vector_pool_workloads write "$GITHUB_WORKSPACE/results/$profile_arch" ivf bufferpool 8193 20 128 > results/profile-write.csv 2> results/profile-write.log
+          "$perf_bin" report -i results/ivf-write.perf --stdio > results/ivf-write-profile.txt
+      - uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: vector-perf-amd64-${{ github.sha }}
+          path: |
+            results/*.json
+            results/*.csv
+            results/*.log
+            results/*.txt
+            results/*.perf
+          retention-days: 14
