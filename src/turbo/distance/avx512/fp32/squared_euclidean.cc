@@ -142,7 +142,7 @@ void squared_euclidean_fp32_distance_avx512(const void *a, const void *b,
 #endif
 }
 
-void squared_euclidean_fp32_batch_distance_avx512_legacy(
+void squared_euclidean_fp32_batch_distance_avx512(
     const void *const *vectors, const void *query, size_t n, size_t dim,
     float *distances, const void *const * /*extra_values*/) {
 #if defined(__AVX512F__)

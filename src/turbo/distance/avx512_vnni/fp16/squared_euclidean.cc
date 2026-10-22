@@ -162,7 +162,7 @@ void squared_euclidean_fp16_distance(const void *lhs, const void *rhs,
                    distance);
 }
 
-void squared_euclidean_fp16_batch_distance_legacy(
+void squared_euclidean_fp16_batch_distance(
     const void *const *vectors, const void *query, size_t count,
     size_t dimension, float *distances, const void *const * /*extra_values*/) {
   const auto *query_fp16 = static_cast<const uint16_t *>(query);
@@ -235,7 +235,7 @@ void squared_euclidean_fp16_distance(const void *lhs, const void *rhs,
                                         nullptr);
 }
 
-void squared_euclidean_fp16_batch_distance_legacy(
+void squared_euclidean_fp16_batch_distance(
     const void *const *vectors, const void *query, size_t count,
     size_t dimension, float *distances, const void *const * /*extra_values*/) {
   const auto *query_fp16 = static_cast<const uint16_t *>(query);
