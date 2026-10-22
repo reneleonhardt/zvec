@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include "flat_streamer_entity.h"
+#if defined(__APPLE__)
+#include <sys/mman.h>
+#endif
 #include <cstdint>
 #include <ailego/pattern/scope_guard.h>
 #include <zvec/ailego/buffer/vector_page_table.h>
@@ -221,6 +224,12 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
   auto *split = dynamic_cast<const turbo::SplitDistanceQuantizer *>(
       quantizer_.get());
   split_distance_ = split ? split->split_distance() : nullptr;
+#if defined(__APPLE__)
+  mmap_prefault_state_.store(storage_->name() == "MMapFileStorage"
+                                 ? MmapPrefaultState::Unprobed
+                                 : MmapPrefaultState::Done,
+                             std::memory_order_relaxed);
+#endif
 
   return 0;
 }
@@ -230,6 +239,9 @@ int FlatStreamerEntity::close() {
   storage_.reset();
   borrowed_pool_ = nullptr;
   split_distance_ = nullptr;
+#if defined(__APPLE__)
+  mmap_prefault_state_.store(MmapPrefaultState::Done, std::memory_order_relaxed);
+#endif
   key_info_map_lock_.reset();
   key_info_map_.clear();
   withid_key_info_map_.clear();
@@ -451,6 +463,10 @@ int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
     }
     block = hd->next;
   }
+#if defined(__APPLE__)
+  if (mmap_prefault_state_.load(std::memory_order_relaxed) != MmapPrefaultState::Done)
+    mmap_prefault_state_.store(MmapPrefaultState::Done, std::memory_order_relaxed);
+#endif
   return 0;
 }
 
@@ -621,12 +637,59 @@ int FlatStreamerEntity::search_borrowed_block(
   return 0;
 }
 
+#if defined(__APPLE__)
+void FlatStreamerEntity::prefault_cold_mmap(const void *const *vectors,
+                                           size_t count) const {
+  std::lock_guard<std::mutex> guard(mmap_prefault_mutex_);
+  if (mmap_prefault_state_.load(std::memory_order_relaxed) == MmapPrefaultState::Done)
+    return;
+  const size_t page_size = ailego::kVectorPageSize;
+  const size_t prefix = 64 * index_meta_.unit_size();
+  if (count > 32 || index_meta_.element_size() > page_size / 4) {
+    mmap_prefault_state_.store(MmapPrefaultState::Done, std::memory_order_relaxed);
+    return;
+  }
+  if (mmap_prefault_state_.load(std::memory_order_relaxed) == MmapPrefaultState::Unprobed) {
+    uintptr_t first = reinterpret_cast<uintptr_t>(vectors[0]), last = first;
+    for (size_t i = 1; i < count; ++i) {
+      first = std::min(first, reinterpret_cast<uintptr_t>(vectors[i]));
+      last = std::max(last, reinterpret_cast<uintptr_t>(vectors[i]));
+    }
+    first -= first % page_size;
+    const size_t pages = (last + prefix - 1 - first) / page_size + 1;
+    char residency[9];
+    bool cold = false;
+    if (pages <= 9 && ::mincore(reinterpret_cast<void *>(first), pages * page_size, residency) == 0) {
+      for (size_t i = 0; i < count; ++i) {
+        const auto address = reinterpret_cast<uintptr_t>(vectors[i]);
+        cold |= !(residency[(address - first) / page_size] & MINCORE_INCORE) ||
+                !(residency[(address + prefix - 1 - first) / page_size] & MINCORE_INCORE);
+      }
+    }
+    mmap_prefault_state_.store(cold ? MmapPrefaultState::Cold : MmapPrefaultState::Done,
+                               std::memory_order_relaxed);
+    if (!cold) return;
+  }
+  // Serialize initial prefix faults; every touched byte is needed by the kernel.
+  for (size_t i = 0; i < count; ++i) {
+    const auto address = reinterpret_cast<uintptr_t>(vectors[i]);
+    (void)*static_cast<const volatile char *>(vectors[i]);
+    if (address / page_size != (address + prefix - 1) / page_size)
+      (void)*(static_cast<const volatile char *>(vectors[i]) + prefix - 1);
+  }
+}
+#endif
+
 bool FlatStreamerEntity::try_bounded_distances(
     const void *query, const void *const *vectors, size_t count, float *distances,
     FlatSearchScratch *scratch, const IndexDocumentHeap *heap) const {
   if (!split_distance_ || !scratch || count < 4 ||
       index_meta_.dimension() <= 64 || !heap->full() || heap->empty())
     return false;
+#if defined(__APPLE__)
+  if (mmap_prefault_state_.load(std::memory_order_relaxed) != MmapPrefaultState::Done)
+    prefault_cold_mmap(vectors, count);
+#endif
   auto &spans = scratch->split_vectors;
   spans.clear();
   spans.reserve(count);
@@ -757,6 +820,12 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone() const {
   entity->storage_ = this->storage_;
   entity->borrowed_pool_ = this->borrowed_pool_;
   entity->split_distance_ = this->split_distance_;
+#if defined(__APPLE__)
+  entity->mmap_prefault_state_.store(storage_->name() == "MMapFileStorage"
+                                        ? MmapPrefaultState::Unprobed
+                                        : MmapPrefaultState::Done,
+                                    std::memory_order_relaxed);
+#endif
   // entity->reformer_ = this->reformer_;
   entity->segments_ = std::move(segments);
   entity->meta_ = this->meta_;
