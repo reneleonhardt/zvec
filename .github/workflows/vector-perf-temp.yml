@@ -15,7 +15,7 @@ jobs:
     env:
       BASELINE_SHA: 8d4996924bce78f8b072a353803c305101bcc807
       BEFORE_SHA: 39f876236f64034da9b03a64621a94ef43da9c97
-      EXACT_REFERENCE_SHA: 0659259a7fae0f5d0fec5337e82a37b975db7a6a
+      DECODE_REFERENCE_SHA: 0659259a7fae0f5d0fec5337e82a37b975db7a6a
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
       CCACHE_MAXSIZE: 3G
@@ -106,7 +106,7 @@ jobs:
         run: |
           set -euo pipefail
           cp -a candidate/.github/benchmarks/vector-perf benchmark-harness
-          git -C candidate fetch --depth=1 origin "$BASELINE_SHA" "$BEFORE_SHA" "$EXACT_REFERENCE_SHA"
+          git -C candidate fetch --depth=1 origin "$BASELINE_SHA" "$BEFORE_SHA" "$DECODE_REFERENCE_SHA"
           for pair in "main:$BASELINE_SHA" "before:$BEFORE_SHA"; do
             label=${pair%%:*}
             revision=${pair#*:}
@@ -160,9 +160,9 @@ jobs:
           cp build-candidate/zvec/lib/libcore_metric.so build-candidate/zvec/lib/libcore_quantizer.so bench-candidate/lib/
           echo "$GITHUB_SHA" > bench-candidate/source-sha.txt
           nice -n 10 python3 benchmark-harness/exact_bits.py \
-            --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$EXACT_REFERENCE_SHA" \
+            --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$DECODE_REFERENCE_SHA" \
             --build-root "$GITHUB_WORKSPACE/build-candidate" \
-            --output "$GITHUB_WORKSPACE/bench-candidate/exact-bits" --build-only \
+              --output "$GITHUB_WORKSPACE/bench-candidate/exact-bits" --decoder-only --build-only \
             > results/original-symbol-build.txt 2>&1
           nice -n 10 python3 benchmark-harness/exact_bits.py \
             --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$BASELINE_SHA" \
@@ -188,7 +188,7 @@ jobs:
           failed=0
           nice -n 10 bench-candidate/turbo_avx2_distance_test > results/arithmetic-check.txt 2>&1 || failed=1
           nice -n 10 bench-candidate/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.CosineDecodePreservesBitsAndExceptionFlags:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization >> results/arithmetic-check.txt 2>&1 || failed=1
-          printf 'Frozen source: %s; candidate: %s\n' "$EXACT_REFERENCE_SHA" "$GITHUB_SHA" > results/original-symbol-check.txt
+          printf 'Frozen decoder source: %s; candidate: %s\n' "$DECODE_REFERENCE_SHA" "$GITHUB_SHA" > results/original-symbol-check.txt
           nice -n 10 bench-candidate/exact-bits >> results/original-symbol-check.txt 2>&1 || failed=1
           printf 'Frozen source: %s; candidate: %s\n' "$BASELINE_SHA" "$GITHUB_SHA" > results/main-symbol-check.txt
           nice -n 10 bench-candidate/main-exact-bits >> results/main-symbol-check.txt 2>&1 || failed=1

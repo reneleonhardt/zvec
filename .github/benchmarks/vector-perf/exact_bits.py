@@ -243,7 +243,9 @@ def main():
     parser.add_argument("--avx512-march", default="icelake-server")
     parser.add_argument("--output", type=Path, help="Keep the compiled proof binary at this path")
     parser.add_argument("--build-only", action="store_true", help="Compile without executing (requires --output)")
-    parser.add_argument("--distance-only", action="store_true", help="Skip decoder proof for references predating the decoder")
+    scope = parser.add_mutually_exclusive_group()
+    scope.add_argument("--distance-only", action="store_true", help="Skip decoder proof for references predating the decoder")
+    scope.add_argument("--decoder-only", action="store_true", help="Use this reference only for decoder proof")
     args = parser.parse_args()
     if args.build_only and args.output is None:
         parser.error("--build-only requires --output")
@@ -278,7 +280,8 @@ def main():
         frozen_header.write_text(source.replace(namespace, "namespace zvec::turbo::reference::avx2 {", 1))
         includes.insert(0, f"-I{temporary}")
         objects = []
-        for index, (isa, path, symbol, half) in enumerate(KERNELS):
+        kernels = [] if args.decoder_only else KERNELS
+        for index, (isa, path, symbol, half) in enumerate(kernels):
             filename = f"src/turbo/distance/{isa}/{path}.cc"
             source = subprocess.check_output(["git", "-C", str(root), "show", f"{source_ref}:{filename}"], text=True)
             namespace = f"namespace zvec::turbo::{isa} {{"
