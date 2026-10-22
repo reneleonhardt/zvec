@@ -28,7 +28,8 @@ jobs:
         run: |
           mkdir -p .apt-vector-perf
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives="$GITHUB_WORKSPACE/.apt-vector-perf" -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends build-essential cmake ninja-build ccache python3 git ca-certificates zstd libaio-dev liburing-dev libzstd-dev linux-tools-common linux-tools-generic
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives="$GITHUB_WORKSPACE/.apt-vector-perf" -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends build-essential cmake ninja-build ccache python3 git ca-certificates zstd libaio-dev liburing-dev libzstd-dev linux-perf
+          perf --version
           mkdir -p results
           lscpu > results/cpu.txt
           uname -a > results/kernel.txt
@@ -145,8 +146,7 @@ jobs:
         if: success()
         run: |
           set -euo pipefail
-          perf_bin=$(find -L /usr/lib/linux-tools* -type f -name perf -print -quit)
-          test -n "$perf_bin"
+          perf_bin=$(command -v perf)
           sudo sysctl -w kernel.perf_event_paranoid=1
           profile_arch=auto
           export VECTOR_PERF_ARCH="$profile_arch"
