@@ -87,6 +87,9 @@ for arch in arches:
         for storage in ('mmap', 'bufferpool'):
             for filtered in (0, 1):
                 invoke(main / 'vector_system_search', ['oracle', data, kind, storage, filtered], output / f'{arch}-oracle-{kind}-{storage}-{filtered}', env)
+                for version, directory in [('main', main), ('before', before), ('candidate', candidate)]:
+                    invoke(directory / 'vector_system_search', ['check', data, kind, storage, filtered],
+                           output / f'{arch}-check-{version}-{kind}-{storage}-{filtered}', env)
     for name, reference in [('main', main), ('before', before)]:
         for kind in kinds:
             for storage in ('mmap', 'bufferpool'):

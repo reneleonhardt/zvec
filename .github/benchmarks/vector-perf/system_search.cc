@@ -44,20 +44,32 @@ static ci::Index::Pointer open_index(const Fixture &f, const std::string &file,
   return index;
 }
 static void search(ci::Index &index, const Fixture &f, size_t id,
-                   const ci::BaseIndexQueryParam::Pointer &q,
+                   const ci::BaseIndexQueryParam::Pointer &q, bool filtered,
                    ci::SearchResult &out, const Expected *gold = nullptr) {
+  // The interface moves the callback into its context on each search.
+  if (filtered) q->filter->set([](uint64_t key) { return key % 7 < 2; });
   require(
       index.search(ci::VectorData{ci::DenseVector{f.query.data() + id * f.dim}},
                    q, &out) == 0 &&
       out.doc_list_.size() == 10);
+  if (filtered)
+    for (const auto &doc : out.doc_list_) require(doc.key() % 7 >= 2);
   if (gold)
     for (size_t j = 0; j < 10; ++j) {
       uint32_t b;
       float s = out.doc_list_[j].score();
       std::memcpy(&b, &s, 4);
       const auto &g = (*gold)[id][j];
-      require(g.key == out.doc_list_[j].key() && b == g.score &&
-              g.index == out.doc_list_[j].index());
+      if (g.key != out.doc_list_[j].key() || b != g.score ||
+          g.index != out.doc_list_[j].index()) {
+        std::fprintf(stderr,
+                     "oracle mismatch query=%zu row=%zu expected=(%llu,%08x,%u) "
+                     "actual=(%llu,%08x,%u)\n",
+                     id, j, (unsigned long long)g.key, g.score, g.index,
+                     (unsigned long long)out.doc_list_[j].key(), b,
+                     out.doc_list_[j].index());
+        throw std::runtime_error("search oracle mismatch");
+      }
     }
 }
 struct Gate {
@@ -133,7 +145,7 @@ int main(int argc, char **argv) {
       auto q = query_param(kind, filtered);
       ci::SearchResult result;
       for (size_t i = 0; i < f.queries; ++i) {
-        search(*index, f, i, q, result);
+        search(*index, f, i, q, filtered, result);
         for (size_t j = 0; j < 10; ++j) {
           auto &d = expected[i][j];
           d.key = result.doc_list_[j].key();
@@ -170,11 +182,11 @@ int main(int argc, char **argv) {
       auto q = query_param(kind, filtered);
       ci::SearchResult result;
       ci::VectorDataBuffer output;
-      for (size_t i = 0; i < f.queries; ++i) {
+      for (size_t i = 0; i < 2 * f.queries; ++i) {
         if (fetching)
           fetch(*index, i, output);
         else
-          search(*index, f, i, q, result, &expected);
+          search(*index, f, i % f.queries, q, filtered, result, &expected);
       }
       require(index->close() == 0);
       return 0;
@@ -225,7 +237,7 @@ int main(int argc, char **argv) {
           if (fetching)
             fetch(*index, trial * 7 + i, output);
           else
-            search(*index, f, (trial * 7 + i) % f.queries, q, result,
+            search(*index, f, (trial * 7 + i) % f.queries, q, filtered, result,
                    &expected);
         }
         double wall =
@@ -292,7 +304,8 @@ int main(int argc, char **argv) {
             if (fetching)
               fetch(*index, i + t * 7, output);
             else
-              search(*index, f, (i + t * 7) % f.queries, q, result, &expected);
+              search(*index, f, (i + t * 7) % f.queries, q, filtered, result,
+                     &expected);
           }
           gate.wait();
           for (size_t trial = 0; trial < trials; ++trial) {
@@ -305,7 +318,7 @@ int main(int argc, char **argv) {
               if (fetching)
                 fetch(*index, n + t * 7, output);
               else
-                search(*index, f, (n + t * 7) % f.queries, q, result,
+                search(*index, f, (n + t * 7) % f.queries, q, filtered, result,
                        &expected);
               if (!begin)
                 latency[t].push_back(std::chrono::duration<double, std::nano>(
