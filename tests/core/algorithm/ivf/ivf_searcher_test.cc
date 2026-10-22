@@ -4448,6 +4448,100 @@ class IVFTurboTest : public testing::TestWithParam<TurboCase> {
   std::string path_;
 };
 
+TEST(IVFScatter, ExactFp32PageFragments) {
+  auto &pool = ailego::MemoryLimitPool::get_instance();
+  const auto capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  const std::string path = "ivf_exact_fragments.index";
+  auto cleanup = ailego::ScopeGuard::Make([&] {
+    ailego::File::RemovePath(path);
+    EXPECT_EQ(0, pool.init(capacity));
+  });
+  class Entity : public IVFEntity {
+   public:
+    void poison(size_t bytes) {
+      scatter_vector_.assign(bytes, 0x99);
+    }
+    bool untouched() const {
+      return std::all_of(scatter_vector_.begin(), scatter_vector_.end(),
+                         [](uint8_t value) { return value == 0x99; });
+    }
+  };
+  constexpr size_t dimension = 80, count = 67;
+  for (const char *metric : {"SquaredEuclidean", "Cosine", "InnerProduct"}) {
+    SCOPED_TRACE(metric);
+    IndexMeta raw(IndexMeta::DT_FP32, dimension);
+    raw.set_metric(metric, 0, ailego::Params());
+    auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
+    ASSERT_EQ(0, quantizer->init(raw, ailego::Params()));
+    auto meta = quantizer->meta();
+    meta.set_quantizer("Fp32Quantizer", 0, ailego::Params());
+    meta.set_major_order(IndexMeta::MO_ROW);
+    std::vector<std::string> codes(count);
+    std::vector<float> row(dimension), query(dimension, .1f);
+    ailego::File::RemovePath(path);
+    auto dumper = IndexFactory::CreateDumper("FileDumper");
+    ASSERT_EQ(0, dumper->create(path));
+    IVFDumper postings(meta, dumper, 1, 8);
+    for (size_t i = 0; i < count; ++i) {
+      for (size_t d = 0; d < dimension; ++d)
+        row[d] = float(int((i * 37 + d * 19 + i * d * 7) % 997) - 498) * .0031f;
+      codes[i].resize(quantizer->quantized_datapoint_vector_length());
+      quantizer->quantize_data(row.data(), codes[i].data());
+      ASSERT_EQ(0, postings.dump_inverted_vector(0, i, codes[i].data()));
+    }
+    ASSERT_EQ(0, postings.dump_inverted_vector_finished());
+    ASSERT_EQ(0, postings.dump_turbo_quantizer(quantizer));
+    ASSERT_EQ(0, IndexHelper::SerializeToDumper(raw, dumper.get()));
+    ASSERT_EQ(0, dumper->close());
+    for (const char *backend : {"MMapFileReadStorage", "BufferReadStorage"}) {
+      SCOPED_TRACE(backend);
+      auto storage = IndexFactory::CreateStorage(backend);
+      ASSERT_EQ(0, storage->init(ailego::Params()));
+      ASSERT_EQ(0, storage->open(path, false));
+      Entity entity;
+      ASSERT_EQ(0, entity.load(storage));
+      IndexQueryMeta qmeta(IndexMeta::DT_FP32, dimension), encoded_meta;
+      std::string encoded;
+      ASSERT_EQ(
+          0, quantizer->quantize(query.data(), qmeta, &encoded, &encoded_meta));
+      auto point = quantizer->distance(encoded.data(), encoded_meta);
+      ASSERT_EQ(0, entity.bind_query(query.data(), qmeta));
+      for (size_t limit : {count, size_t(11)}) {
+        for (bool filtered : {false, true, false}) {
+          entity.poison(meta.element_size());
+          IndexDocumentHeap heap(limit), expected(limit);
+          IndexContext::Stats counters;
+          uint32_t scanned = 0;
+          IndexFilter filter;
+          if (filtered) filter.set([](uint64_t key) { return key % 2 == 0; });
+          for (size_t i = 0; i < count; ++i)
+            if (!filtered || i % 2)
+              expected.emplace(i, point(codes[i].data()), i);
+          ASSERT_EQ(0, filtered ? entity.search(0, query.data(), filter,
+                                                &scanned, &heap, &counters)
+                                : entity.search(0, query.data(), &scanned,
+                                                &heap, &counters));
+          EXPECT_EQ(expected.size(), heap.size());
+          while (!heap.empty()) {
+            const auto document = heap.front();
+            EXPECT_EQ(expected.front().key(), document.key());
+            const float wanted = expected.front().score();
+            const float actual = document.score();
+            EXPECT_EQ(0, std::memcmp(&wanted, &actual, sizeof(float)));
+            heap.pop();
+            expected.pop();
+          }
+#if defined(AILEGO_ARM64_NEON)
+          EXPECT_TRUE(entity.untouched());
+#endif
+        }
+      }
+      ASSERT_EQ(0, storage->close());
+    }
+  }
+}
+
 TEST_P(IVFTurboTest, PostingFormatDetection) {
   for (bool future_version : {false, true}) {
     SCOPED_TRACE(future_version);

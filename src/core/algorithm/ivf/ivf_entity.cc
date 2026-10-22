@@ -17,6 +17,7 @@
 #include <limits>
 #include <core/quantizer/quantizer_params.h>
 #include <turbo/quantizer/common/pq_quantizer/packed_code_quantizer.h>
+#include <turbo/quantizer/split_distance_quantizer.h>
 #include "metric/metric_params.h"
 #include "ivf_utility.h"
 namespace zvec {
@@ -92,10 +93,13 @@ class ScatterCursor {
 //! Calculate a row-major IVF block directly from its resident page spans.
 //! Only a vector split by a page boundary is copied into scratch.
 template <typename Distance>
-bool calculate_row_major_block(ScatterCursor *cursor, const Distance &distance,
-                               size_t vector_count, size_t element_size,
-                               size_t serialized_size, uint8_t *scratch,
-                               float *distances, bool calculate) {
+bool calculate_row_major_block(
+    ScatterCursor *cursor, const Distance &distance, size_t vector_count,
+    size_t element_size, size_t serialized_size, uint8_t *scratch,
+    float *distances, bool calculate,
+    turbo::SplitDistanceQuantizer::Distance split = nullptr,
+    const turbo::DistanceImpl *query = nullptr,
+    const IndexDocumentHeap *heap = nullptr) {
   if (element_size == 0 ||
       vector_count > std::numeric_limits<size_t>::max() / element_size) {
     return false;
@@ -106,6 +110,33 @@ bool calculate_row_major_block(ScatterCursor *cursor, const Distance &distance,
   }
   if (!calculate) {
     return cursor->skip(serialized_size);
+  }
+
+  // Batch across page boundaries without changing the bound point arithmetic.
+  if (split && query && vector_count <= 64) {
+    auto next = *cursor;
+    turbo::SplitVector spans[64];
+    bool valid = true;
+    for (size_t i = 0; i < vector_count; ++i) {
+      const size_t prefix = std::min(element_size, next.contiguous_size());
+      spans[i] = {next.data(), nullptr, prefix};
+      if (!next.skip(prefix)) return false;
+      if (prefix != element_size) {
+        const size_t remaining = element_size - prefix;
+        if (next.contiguous_size() < remaining) {
+          valid = false;
+          break;
+        }
+        spans[i].second = next.data();
+        if (!next.skip(remaining)) return false;
+      }
+    }
+    const float cutoff = heap && heap->full() && !heap->empty()
+                             ? heap->front().score()
+                             : std::numeric_limits<float>::infinity();
+    if (valid && split(spans, vector_count, query->query_storage().data(),
+                       query->dim(), distances, cutoff))
+      return cursor->skip(serialized_size);
   }
 
   size_t processed = 0;
@@ -857,6 +888,10 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
                                       float *out) {
     query_features_distance(query, features, count, out);
   };
+  const auto *split_quantizer =
+      dynamic_cast<const turbo::SplitDistanceQuantizer *>(quantizer_.get());
+  const auto split =
+      split_quantizer ? split_quantizer->split_distance() : nullptr;
   const bool row_major = meta_.major_order() == IndexMeta::MO_ROW;
   if (row_major) {
     scatter_vector_.resize(element_size);
@@ -926,10 +961,11 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
       }
 
       if (row_major) {
-        if (!calculate_row_major_block(&scatter_cursor, distance, vecs_count,
-                                       element_size, serialized_size,
-                                       scatter_vector_.data(), distances.data(),
-                                       true)) {
+        if (!calculate_row_major_block(
+                &scatter_cursor, distance, vecs_count, element_size,
+                serialized_size, scatter_vector_.data(), distances.data(), true,
+                scatter_data.spans.size() > 1 ? split : nullptr,
+                &query_distance_, norm_val == 1.0f ? heap : nullptr)) {
           LOG_ERROR("Invalid scatter-read IVF block, off=%zu, size=%zu",
                     off + block_offset, serialized_size);
           return IndexError_ReadData;
@@ -982,6 +1018,10 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
                                       float *out) {
     query_features_distance(query, features, count, out);
   };
+  const auto *split_quantizer =
+      dynamic_cast<const turbo::SplitDistanceQuantizer *>(quantizer_.get());
+  const auto split =
+      split_quantizer ? split_quantizer->split_distance() : nullptr;
   const bool row_major = meta_.major_order() == IndexMeta::MO_ROW;
   if (row_major) {
     scatter_vector_.resize(element_size);
@@ -1029,10 +1069,11 @@ int IVFEntity::search(size_t inverted_list_id, const void *query,
       }
       const size_t serialized_size = std::min(block_size, size - block_offset);
       if (row_major) {
-        if (!calculate_row_major_block(&scatter_cursor, distance, vecs_count,
-                                       element_size, serialized_size,
-                                       scatter_vector_.data(), distances.data(),
-                                       true)) {
+        if (!calculate_row_major_block(
+                &scatter_cursor, distance, vecs_count, element_size,
+                serialized_size, scatter_vector_.data(), distances.data(), true,
+                scatter_data.spans.size() > 1 ? split : nullptr,
+                &query_distance_, norm_val == 1.0f ? heap : nullptr)) {
           LOG_ERROR("Invalid scatter-read IVF block, off=%zu, size=%zu",
                     off + block_offset, serialized_size);
           return IndexError_ReadData;
