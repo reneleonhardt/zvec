@@ -19,21 +19,50 @@ jobs:
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
       CCACHE_MAXSIZE: 3G
     steps:
+      - uses: actions/cache/restore@v6
+        with:
+          path: .apt-vector-perf/*.deb
+          key: vector-perf-apt-2604-v1-${{ github.run_id }}
+          restore-keys: vector-perf-apt-2604-v1-
       - name: Install benchmark build tools
         run: |
+          mkdir -p .apt-vector-perf
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends build-essential cmake ninja-build ccache python3 git ca-certificates zstd libaio-dev liburing-dev libzstd-dev linux-tools-common linux-tools-generic
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives="$GITHUB_WORKSPACE/.apt-vector-perf" -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends build-essential cmake ninja-build ccache python3 git ca-certificates zstd libaio-dev liburing-dev libzstd-dev linux-tools-common linux-tools-generic
           mkdir -p results
           lscpu > results/cpu.txt
           uname -a > results/kernel.txt
           cat /etc/os-release > results/os-release.txt
           c++ --version > results/compiler.txt
           cmake --version > results/cmake.txt
+      - uses: actions/cache/save@v6
+        with:
+          path: .apt-vector-perf/*.deb
+          key: vector-perf-apt-2604-v1-${{ github.run_id }}
       - uses: actions/checkout@v7
         with:
           submodules: recursive
           path: candidate
-      - uses: actions/cache@v6
+      - name: Identify compatible reference binaries
+        id: toolchain
+        run: |
+          fingerprint=$({
+            c++ --version
+            cmake --version
+            ld --version
+            ldd --version
+            grep -E '^(Model name|Flags):' results/cpu.txt
+          } | sha256sum | cut -c 1-24)
+          echo "key=$fingerprint" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@v6
+        id: references
+        with:
+          path: |
+            bench-main
+            bench-before
+          key: vector-perf-refs-v1-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ env.BASELINE_SHA }}-${{ env.BEFORE_SHA }}-${{ hashFiles('candidate/.github/benchmarks/vector-perf/*.cc', 'candidate/.github/benchmarks/vector-perf/*.h', 'candidate/.github/benchmarks/vector-perf/*.c', 'candidate/.github/benchmarks/vector-perf/CMakeLists.txt') }}
+      - uses: actions/cache/restore@v6
+        id: build-cache
         with:
           path: .ccache-vector-perf
           key: vector-perf-2604-gcc-${{ runner.arch }}-${{ github.sha }}
@@ -46,21 +75,40 @@ jobs:
           for pair in "main:$BASELINE_SHA" "before:$BEFORE_SHA" "candidate:$GITHUB_SHA"; do
             label=${pair%%:*}
             revision=${pair#*:}
-            git -C candidate checkout --detach "$revision"
-            git -C candidate submodule update --init --recursive
-            test "$(git -C candidate rev-parse HEAD)" = "$revision"
-            nice -n 10 cmake -S benchmark-harness -B bench-build -G Ninja \
-              -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE/candidate" -DCMAKE_BUILD_TYPE=Release \
-              -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-            nice -n 10 cmake --build bench-build --target vector_system_search vector_pool_workloads vector_alloc_probe --parallel 4
-            mkdir "bench-$label"
-            cp bench-build/vector_system_search bench-build/vector_pool_workloads bench-build/libvector_alloc_probe.so "bench-$label/"
+            if [[ -x "bench-$label/vector_system_search" ]]; then
+              test "$(cat "bench-$label/source-sha.txt")" = "$revision"
+              echo "Reusing frozen $label executables"
+            else
+              git -C candidate checkout --detach "$revision"
+              git -C candidate submodule update --init --recursive
+              test "$(git -C candidate rev-parse HEAD)" = "$revision"
+              nice -n 10 cmake -S benchmark-harness -B bench-build -G Ninja \
+                -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE/candidate" -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+              nice -n 10 cmake --build bench-build --target vector_system_search vector_pool_workloads vector_alloc_probe --parallel 4
+              mkdir "bench-$label"
+              cp bench-build/vector_system_search bench-build/vector_pool_workloads bench-build/libvector_alloc_probe.so "bench-$label/"
+              echo "$revision" > "bench-$label/source-sha.txt"
+            fi
             ldd "bench-$label/vector_system_search" > "results/$label-libraries.txt"
             if grep -q '/bench-build/' "results/$label-libraries.txt"; then
               echo "Unexpected mutable runtime library dependency" >&2
               exit 1
             fi
           done
+          ccache --show-stats > results/ccache.txt
+      - uses: actions/cache/save@v6
+        if: steps.references.outputs.cache-hit != 'true'
+        with:
+          path: |
+            bench-main
+            bench-before
+          key: ${{ steps.references.outputs.cache-primary-key }}
+      - uses: actions/cache/save@v6
+        if: always() && steps.build-cache.outputs.cache-hit != 'true'
+        with:
+          path: .ccache-vector-perf
+          key: vector-perf-2604-gcc-${{ runner.arch }}-${{ github.sha }}
       - name: Paired CPU allocation and wall-time benchmarks
         run: |
           set -euo pipefail
