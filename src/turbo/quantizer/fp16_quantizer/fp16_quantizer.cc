@@ -19,6 +19,7 @@
 #include <ailego/math/normalizer.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_factory.h>
+#include "neon_fp16/fp16/squared_euclidean.h"
 
 namespace zvec {
 namespace turbo {
@@ -62,6 +63,18 @@ int Fp16Quantizer::init(const IndexMeta &meta, const ailego::Params &params) {
   dp_query_batch_func_ = std::move(kernels.batch);
 
   return 0;
+}
+
+SplitDistanceQuantizer::Distance Fp16Quantizer::split_distance() const {
+#if defined(AILEGO_ARM64_NEON)
+  const auto *kernel = dp_query_func_.target<
+      decltype(&neon_fp16::squared_euclidean_fp16_distance_neon_fp16)>();
+  if (kernel &&
+      *kernel == neon_fp16::squared_euclidean_fp16_distance_neon_fp16 &&
+      original_dim_ % 16 == 0)
+    return neon_fp16::squared_euclidean_fp16_split_batch_distance;
+#endif
+  return nullptr;
 }
 
 int Fp16Quantizer::quantize(const void *query, const IndexQueryMeta &qmeta,

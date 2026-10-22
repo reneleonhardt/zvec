@@ -13,6 +13,9 @@
 // limitations under the License.
 
 #include "neon_fp16/fp16/squared_euclidean.h"
+#include <algorithm>
+#include <cmath>
+#include <limits>
 #include "common/fp16_common.h"
 #if ZVEC_TURBO_FP16_NEON
 #include <arm_neon.h>
@@ -25,6 +28,106 @@ namespace zvec::turbo::neon_fp16 {
 
 #if ZVEC_TURBO_FP16_NEON
 namespace {
+
+template <bool Bounded>
+bool split_batch_distance(const SplitVector *vectors, size_t count,
+                           const void *query, size_t dim, float *distances,
+                           float cutoff) {
+  if (dim % 16) return false;
+  for (size_t i = 0; i < count; ++i)
+    if (vectors[i].first_bytes % (16 * sizeof(float16_t)) ||
+        vectors[i].first_bytes / sizeof(float16_t) > dim)
+      return false;
+  const auto *q = static_cast<const float16_t *>(query);
+  using Accumulator = detail::Fp32DistanceAccumulator<true>;
+  size_t i = 0;
+  for (; count - i >= 4;) {
+    const float16_t *data[4];
+    size_t cuts[4];
+    Accumulator sums[4];
+    for (size_t row = 0; row < 4; ++row) {
+      data[row] = static_cast<const float16_t *>(vectors[i + row].first);
+      cuts[row] = vectors[i + row].first_bytes / sizeof(float16_t);
+    }
+    size_t d = 0;
+    bool rejected = false;
+    bool single_survivor = false;
+    while (d < dim) {
+      size_t end = dim;
+      for (size_t row = 0; row < 4; ++row) {
+        if (cuts[row] == d) {
+          data[row] = static_cast<const float16_t *>(vectors[i + row].second);
+          cuts[row] = dim;
+        }
+        end = std::min(end, cuts[row]);
+      }
+      if constexpr (Bounded)
+        if (d < 64) end = std::min(end, size_t(64));
+      for (; d < end; d += 16) {
+        const auto query0 = vld1q_f16(q + d), query1 = vld1q_f16(q + d + 8);
+        const auto q0 = vcvt_f32_f16(vget_low_f16(query0));
+        const auto q1 = vcvt_high_f32_f16(query0);
+        const auto q2 = vcvt_f32_f16(vget_low_f16(query1));
+        const auto q3 = vcvt_high_f32_f16(query1);
+        for (size_t row = 0; row < 4; ++row) {
+          sums[row].add16(data[row], q0, q1, q2, q3);
+          data[row] += 16;
+        }
+      }
+      if constexpr (Bounded) {
+        if (d == 64 && d < dim) {
+          unsigned survivors = 0;
+          for (size_t row = 0; row < 4; ++row)
+            if (!(sums[row].reduce() >= cutoff)) survivors |= 1U << row;
+          rejected = survivors == 0;
+          if (rejected) break;
+          if (dim >= 256 && (survivors & (survivors - 1)) == 0) {
+            // For long rows, recompute the winner with the ordinary reduction.
+            const size_t row = __builtin_ctz(survivors);
+            float distance;
+            split_batch_distance<false>(vectors + i + row, 1, query, dim,
+                                        &distance, 0);
+            for (size_t r = 0; r < 4; ++r)
+              distances[i + r] = std::numeric_limits<float>::infinity();
+            distances[i + row] = distance;
+            single_survivor = true;
+            break;
+          }
+        }
+      }
+    }
+    if (!single_survivor)
+      for (size_t row = 0; row < 4; ++row)
+        distances[i + row] = rejected ? std::numeric_limits<float>::infinity()
+                                      : sums[row].reduce();
+    i += 4;
+    if constexpr (Bounded) {
+      if (!rejected && !single_survivor) {
+        const size_t rest = std::min(count - i, (32 - i % 32) % 32);
+        split_batch_distance<false>(vectors + i, rest, query, dim, distances + i, 0);
+        i += rest;
+      }
+    }
+  }
+  for (; i < count; ++i) {
+    Accumulator sum;
+    const auto *rhs = q;
+    auto accumulate = [&](const void *span, size_t length) {
+      const auto *lhs = static_cast<const float16_t *>(span);
+      for (size_t d = 0; d < length; d += 16, rhs += 16) {
+        const auto q0 = vld1q_f16(rhs), q1 = vld1q_f16(rhs + 8);
+        sum.add16(lhs + d, vcvt_f32_f16(vget_low_f16(q0)),
+                  vcvt_high_f32_f16(q0), vcvt_f32_f16(vget_low_f16(q1)),
+                  vcvt_high_f32_f16(q1));
+      }
+    };
+    const size_t first = vectors[i].first_bytes / sizeof(float16_t);
+    accumulate(vectors[i].first, first);
+    accumulate(vectors[i].second, dim - first);
+    distances[i] = sum.reduce();
+  }
+  return true;
+}
 
 // Widen before subtraction as well as multiplication and accumulation:
 // even the difference between two finite FP16 inputs may exceed FP16 range.
@@ -76,6 +179,24 @@ inline float squared_euclidean_fp16_accum(const float16_t *lhs,
 
 }  // namespace
 #endif
+
+bool squared_euclidean_fp16_split_batch_distance(
+    const SplitVector *vectors, size_t count, const void *query, size_t dim,
+    float *distances, float cutoff) {
+#if ZVEC_TURBO_FP16_NEON
+  if (dim <= 64 || !std::isfinite(cutoff))
+    return split_batch_distance<false>(vectors, count, query, dim, distances, 0);
+  return split_batch_distance<true>(vectors, count, query, dim, distances, cutoff);
+#else
+  (void)vectors;
+  (void)count;
+  (void)query;
+  (void)dim;
+  (void)distances;
+  (void)cutoff;
+  return false;
+#endif
+}
 
 // Compute squared euclidean distance between a single FP16 vector pair.
 void squared_euclidean_fp16_distance_neon_fp16(const void *a, const void *b,

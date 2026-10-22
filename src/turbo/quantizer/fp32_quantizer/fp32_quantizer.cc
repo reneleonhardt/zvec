@@ -17,9 +17,11 @@
 #include <cstring>
 #include <vector>
 #include <ailego/math/normalizer.h>
+#include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_factory.h>
 #include "core/quantizer/record_quantizer.h"
+#include "neon/fp32/squared_euclidean.h"
 
 namespace zvec {
 namespace turbo {
@@ -141,6 +143,17 @@ void Fp32Quantizer::quantize_one(const void *input, void *output) const {
   } else {
     std::memcpy(output, input, byte_size);
   }
+}
+
+SplitDistanceQuantizer::Distance Fp32Quantizer::split_distance() const {
+#if defined(AILEGO_ARM64_NEON)
+  const auto *kernel = dp_query_func_.target<
+      decltype(&neon::squared_euclidean_fp32_distance)>();
+  if (kernel && *kernel == neon::squared_euclidean_fp32_distance &&
+      original_dim_ % 8 == 0)
+    return neon::squared_euclidean_fp32_bounded_split_batch_distance;
+#endif
+  return nullptr;
 }
 
 float Fp32Quantizer::calc_distance_dp_query(const void *dp,

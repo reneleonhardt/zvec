@@ -19,13 +19,14 @@
 #include <zvec/core/framework/index_reformer.h>
 #include <zvec/core/framework/index_stats.h>
 #include "quantizer/quantizer.h"
+#include "quantizer/split_distance_quantizer.h"
 
 namespace zvec {
 namespace turbo {
 
 using namespace zvec::core;
 
-class Fp32Quantizer : public Quantizer {
+class Fp32Quantizer : public Quantizer, public SplitDistanceQuantizer {
  public:
   Fp32Quantizer() : Quantizer(QuantizeType::kFp32) {}
 
@@ -89,6 +90,8 @@ class Fp32Quantizer : public Quantizer {
       float *dist_list) const override;
 
   float calc_distance_dp_dp(const void *dp1, const void *dp2) const override;
+
+  SplitDistanceQuantizer::Distance split_distance() const override;
 
   float calc_distance_input_query(const void *dp,
                                   const void *query) const override;

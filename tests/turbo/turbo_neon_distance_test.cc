@@ -13,6 +13,11 @@
 // limitations under the License.
 
 #include <array>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <random>
+#include <type_traits>
 #include <vector>
 #include <gtest/gtest.h>
 #include <zvec/ailego/internal/platform.h>
@@ -24,6 +29,7 @@
 #include "distance/neon/fp32/cosine.h"
 #include "distance/neon/fp32/inner_product.h"
 #include "distance/neon/fp32/squared_euclidean.h"
+#include "distance/neon_fp16/fp16/squared_euclidean.h"
 #include "distance/neon/record_quantized_int4/common.h"
 #include "distance/neon/record_quantized_int8/common.h"
 #include "distance/scalar/fp16/cosine.h"
@@ -74,6 +80,166 @@ TEST(NeonDistance, Fp32MatchesScalarForRemainders) {
                     a.data(), b.data(), dim, 1e-5f);
   }
 #endif
+}
+
+TEST(NeonDistance, Fp32BatchPreservesScalarBits) {
+  std::mt19937 generator(1927);
+  std::uniform_real_distribution<float> random(-3.2f, 3.2f);
+  for (float scale : {1.f, 1e10f, 1e-20f}) {
+    std::vector<float> query(770);
+    for (auto &v : query) v = random(generator) * scale;
+    std::vector<std::vector<float>> rows(9, std::vector<float>(770));
+    std::vector<const void *> pointers;
+    for (auto &row : rows) {
+      for (auto &v : row) v = random(generator) * scale;
+      pointers.push_back(row.data() + 1);
+    }
+    rows[0] = query;
+    pointers[0] = rows[0].data() + 1;
+    for (size_t dim : {0U, 1U, 7U, 8U, 9U, 16U, 17U, 31U, 32U, 768U, 769U}) {
+      for (size_t count : {0U, 1U, 3U, 4U, 5U, 7U, 8U, 9U}) {
+        std::vector<float> expected(count + 1, 12345.f), actual = expected;
+        for (size_t i = 0; i < count; ++i)
+          neon::squared_euclidean_fp32_distance(pointers[i], query.data() + 1, dim,
+                                                &expected[i]);
+        neon::squared_euclidean_fp32_batch_distance(
+            pointers.data(), query.data() + 1, count, dim, actual.data(), nullptr);
+        EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                                 actual.size() * sizeof(float)))
+            << "dim=" << dim << " count=" << count << " scale=" << scale;
+      }
+    }
+  }
+}
+
+TEST(NeonDistance, Fp32SplitPreservesScalarBits) {
+  std::mt19937 generator(637);
+  std::uniform_real_distribution<float> random(-3.f, 3.f);
+  for (size_t dim : {0U, 8U, 9U, 16U, 768U, 769U}) {
+    std::vector<std::vector<float>> rows(9, std::vector<float>(dim + 1));
+    std::vector<float> query(dim + 1);
+    for (auto &row : rows)
+      for (auto &v : row) v = random(generator);
+    for (auto &v : query) v = random(generator);
+    for (size_t prefix = 0; prefix <= dim; prefix += 4) {
+      std::vector<std::vector<float>> first(9), second(9);
+      std::vector<SplitVector> vectors;
+      for (size_t i = 0; i < rows.size(); ++i) {
+        const size_t cut = std::min(dim, (prefix + i * 8) % (dim + 8));
+        first[i].assign(rows[i].begin(), rows[i].begin() + cut + 1);
+        second[i].assign(rows[i].begin() + cut, rows[i].end());
+        vectors.push_back({first[i].data() + 1, second[i].data() + 1,
+                           cut * sizeof(float)});
+      }
+      for (size_t count : {0U, 1U, 3U, 4U, 5U, 7U, 8U, 9U}) {
+        bool supported = false;
+#if defined(AILEGO_ARM64_NEON)
+        supported = dim % 8 == 0 && (count == 0 || prefix % 8 == 0);
+#endif
+        std::vector<float> expected(count + 1, 12345.f), actual = expected;
+        if (supported)
+          for (size_t i = 0; i < count; ++i)
+            neon::squared_euclidean_fp32_distance(
+                rows[i].data() + 1, query.data() + 1, dim, &expected[i]);
+        EXPECT_EQ(supported,
+                  neon::squared_euclidean_fp32_bounded_split_batch_distance(
+                      vectors.data(), count, query.data() + 1, dim, actual.data(),
+                      std::numeric_limits<float>::infinity()));
+        EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                                actual.size() * sizeof(float)))
+            << "dim=" << dim << " prefix=" << prefix << " count=" << count;
+      }
+    }
+    float untouched[2] = {12345.f, 12345.f};
+    SplitVector invalid[] = {
+        {rows[0].data(), nullptr, dim * sizeof(float)},
+        {rows[0].data(), rows[0].data(), (dim + 8) * sizeof(float)}};
+    EXPECT_FALSE(neon::squared_euclidean_fp32_bounded_split_batch_distance(
+        invalid, 2, query.data(), dim, untouched,
+        std::numeric_limits<float>::infinity()));
+    EXPECT_EQ(12345.f, untouched[0]);
+    EXPECT_EQ(12345.f, untouched[1]);
+  }
+}
+
+template <typename T>
+void check_bounded_distances(
+    size_t stride, SplitDistanceQuantizer::Distance bounded,
+    void (*ordinary)(const void *, const void *, size_t, float *)) {
+  auto encode = [](float value) {
+    if constexpr (std::is_same_v<T, float>) return value;
+    else {
+      uint16_t half;
+      ailego::FloatHelper::ToFP16(&value, 1, &half);
+      return half;
+    }
+  };
+  for (size_t dim : {stride, size_t(64), 64 + stride, size_t(128), size_t(256), size_t(768)}) {
+    std::vector<T> query(dim, encode(.25f));
+    std::vector<std::vector<T>> rows(49, std::vector<T>(dim, encode(2.f)));
+    rows[4] = query;
+    rows[5] = query;
+    rows[5].back() = encode(.2501f);
+    rows[2].back() = encode(std::numeric_limits<float>::quiet_NaN());
+    rows[3].back() = encode(std::numeric_limits<float>::infinity());
+    for (size_t row : {32U, 37U, 42U, 47U}) rows[row] = query;
+    rows[37].back() = encode(.273f);
+    rows[42].back() = encode(std::numeric_limits<float>::quiet_NaN());
+    for (size_t d = 0; d < dim; ++d)
+      rows[47][d] = encode(.25f + .005f * (int(d % 7) - 3));
+    std::vector<SplitVector> views;
+    std::vector<float> expected(rows.size());
+    for (size_t i = 0; i < rows.size(); ++i) {
+      const size_t prefix = (i * stride) % (dim + stride);
+      views.push_back({rows[i].data(), rows[i].data() + prefix,
+                        prefix * sizeof(T)});
+      ordinary(rows[i].data(), query.data(), dim, &expected[i]);
+    }
+    for (float cutoff : {0.f, .00001f, 1.f, -1.f,
+                         std::numeric_limits<float>::max(),
+                         std::numeric_limits<float>::infinity(),
+                         std::numeric_limits<float>::quiet_NaN()}) {
+      for (size_t count : {0U, 1U, 3U, 4U, 5U, 8U, 9U, 32U, 33U, 37U, 41U, 49U}) {
+        std::vector<float> actual(count + 1, 12345.f);
+        ASSERT_TRUE(bounded(
+            views.data(), count, query.data(), dim, actual.data(), cutoff));
+        for (size_t i = 0; i < count; ++i) {
+          if (!std::isfinite(cutoff) || expected[i] < cutoff)
+            EXPECT_EQ(0, std::memcmp(&expected[i], &actual[i], sizeof(float)));
+          else
+            EXPECT_TRUE(std::isnan(actual[i]) || actual[i] >= cutoff);
+        }
+        EXPECT_EQ(12345.f, actual[count]);
+        if (count >= 4 && dim > 64 && cutoff == 1.f)
+          EXPECT_EQ(std::numeric_limits<float>::infinity(), actual[0]);
+        if (count >= 37 && dim >= 256 && cutoff == 1.f)
+          EXPECT_EQ(std::numeric_limits<float>::infinity(), actual[33]);
+      }
+    }
+  }
+}
+
+TEST(NeonDistance, BoundedFp32KeepsEveryPossibleWinnerExact) {
+#if !defined(AILEGO_ARM64_NEON)
+  GTEST_SKIP();
+#endif
+  check_bounded_distances<float>(
+      8, neon::squared_euclidean_fp32_bounded_split_batch_distance,
+      neon::squared_euclidean_fp32_distance);
+}
+
+TEST(NeonDistance, BoundedFp16KeepsEveryPossibleWinnerExact) {
+  const auto kernels = get_distance_kernels(
+      MetricType::kSquaredEuclidean, DataType::kFp16, QuantizeType::kFp16,
+      CpuArchType::kAuto);
+  const auto *kernel = kernels.dist.target<
+      decltype(&neon_fp16::squared_euclidean_fp16_distance_neon_fp16)>();
+  if (!kernel ||
+      *kernel != neon_fp16::squared_euclidean_fp16_distance_neon_fp16)
+    GTEST_SKIP();
+  check_bounded_distances<uint16_t>(
+      16, neon_fp16::squared_euclidean_fp16_split_batch_distance,
+      neon_fp16::squared_euclidean_fp16_distance_neon_fp16);
 }
 
 TEST(NeonDistance, Fp16MatchesScalarForRemainders) {

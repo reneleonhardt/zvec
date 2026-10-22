@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstddef>
+#include "quantizer/split_distance_quantizer.h"
 
 namespace zvec::turbo::neon {
 
@@ -27,5 +28,10 @@ void squared_euclidean_fp32_batch_distance(const void *const *vectors,
                                            const void *query, size_t n,
                                            size_t dim, float *distances,
                                            const void *const *extra_values);
+
+// Distances below cutoff remain exact; proven losers may be marked infinite.
+bool squared_euclidean_fp32_bounded_split_batch_distance(
+    const SplitVector *vectors, size_t count, const void *query, size_t dim,
+    float *distances, float cutoff);
 
 }  // namespace zvec::turbo::neon

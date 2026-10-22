@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstddef>
+#include "quantizer/split_distance_quantizer.h"
 
 namespace zvec::turbo::neon_fp16 {
 
@@ -29,5 +30,10 @@ void squared_euclidean_fp16_distance_neon_fp16(const void *a, const void *b,
 void squared_euclidean_fp16_batch_distance_neon_fp16(
     const void *const *vectors, const void *query, size_t n, size_t dim,
     float *distances, const void *const *extra_values);
+
+// Preserve ordinary scores across pinned spans, pruning only proven losers.
+bool squared_euclidean_fp16_split_batch_distance(
+    const SplitVector *vectors, size_t count, const void *query, size_t dim,
+    float *distances, float cutoff);
 
 }  // namespace zvec::turbo::neon_fp16
