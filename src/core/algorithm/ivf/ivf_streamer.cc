@@ -350,6 +350,21 @@ IndexSearcher::Context::Pointer IVFStreamer::create_context() const {
   return Context::Pointer(context);
 }
 
+int IVFStreamer::fetch_vector(uint64_t key, Context::Pointer &context,
+                              std::string &vector) const {
+  auto *ctx = dynamic_cast<IVFSearcherContext *>(context.get());
+  if (searcher_state_ != STATE_LOADED || !ctx) return IndexError_NoReady;
+  if (ctx->magic() != magic_ && update_context(ctx) != 0) {
+    return IndexError_NoReady;
+  }
+  auto &provider = ctx->fetch_provider();
+  if (!provider) provider = create_provider();
+  if (!provider) return IndexError_NoReady;
+  // Keep fetch scratch separate from vectors borrowed by search results.
+  return static_cast<IVFIndexProvider *>(provider.get())
+      ->copy_vector(key, &vector);
+}
+
 IndexProvider::Pointer IVFStreamer::create_provider() const {
   if (searcher_state_ != STATE_LOADED) {
     LOG_ERROR("Load the index first before create provider");

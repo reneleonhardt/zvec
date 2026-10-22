@@ -14,6 +14,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <limits>
 #include <memory>
@@ -273,7 +274,7 @@ class ZVEC_CORE_API Index {
   // kernels. When set, converter_/reformer_/metric_ stay null.
   std::shared_ptr<turbo::Quantizer> turbo_quantizer_{};
 
-  size_t context_index_{std::numeric_limits<size_t>::max()};
+  std::atomic<size_t> context_index_{std::numeric_limits<size_t>::max()};
   core::IndexStorage::Pointer storage_{};
 
   bool is_open_{false};

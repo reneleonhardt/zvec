@@ -17,6 +17,7 @@
 #include <cmath>
 #include <limits>
 #include <magic_enum/magic_enum.hpp>
+#include <ailego/pattern/scope_guard.h>
 #include <turbo/quantizer/quantizer.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_holder.h>
@@ -213,10 +214,14 @@ thread_local static std::array<core::IndexContext::Pointer,
 
 
 bool Index::init_context() {
-  context_index_ = (magic_enum::enum_integer(param_.index_type) - 1) * 2 +
-                   static_cast<size_t>(is_sparse_);
-  if (context_list[context_index_] == nullptr) {
-    if ((context_list[context_index_] = streamer_->create_context()) ==
+  const size_t index = (magic_enum::enum_integer(param_.index_type) - 1) * 2 +
+                       static_cast<size_t>(is_sparse_);
+  // Only the slot marker is shared; contexts remain local to each thread.
+  if (context_index_.load(std::memory_order_relaxed) != index) {
+    context_index_.store(index, std::memory_order_relaxed);
+  }
+  if (context_list[index] == nullptr) {
+    if ((context_list[index] = streamer_->create_context()) ==
         nullptr) {
       LOG_ERROR("Failed to create context");
       return false;
@@ -227,7 +232,7 @@ bool Index::init_context() {
 
 core::IndexContext::Pointer &Index::acquire_context() {
   init_context();
-  return context_list[context_index_];
+  return context_list[context_index_.load(std::memory_order_relaxed)];
 }
 
 int Index::train() {
@@ -645,9 +650,11 @@ int Index::close() {
   // own cloned storage segments, so leaving the current thread's context in
   // the cache after Close would keep the buffer pool (and its metadata/pages)
   // alive until another IVF search or thread exit.
-  if (context_index_ < context_list.size()) {
-    context_list[context_index_].reset();
-    context_index_ = std::numeric_limits<size_t>::max();
+  const auto context_index = context_index_.load(std::memory_order_relaxed);
+  if (context_index < context_list.size()) {
+    context_list[context_index].reset();
+    context_index_.store(std::numeric_limits<size_t>::max(),
+                         std::memory_order_relaxed);
   }
   if (ailego_unlikely(storage_->close() != 0)) {
     LOG_ERROR("Failed to close storage");
@@ -851,9 +858,23 @@ int Index::_dense_fetch(const uint32_t doc_id,
 
   DenseVectorBuffer dense_vector_buffer;
   std::string &out_vector_buffer = dense_vector_buffer.data;
-  // for int4, unit_size * dim != element_size
-  out_vector_buffer.resize(input_vector_meta_.element_size());
-
+  auto *previous =
+      std::get_if<DenseVectorBuffer>(&vector_data_buffer->vector_buffer);
+  constexpr size_t scratch_limit = 64 * 1024;
+  std::string *scratch = nullptr;
+  if (previous && previous->data.size() > 32 &&
+      previous->data.size() == input_vector_meta_.element_size() &&
+      previous->data.size() <= scratch_limit) {
+    static thread_local std::string recycled;
+    // Own scratch locally so failed or nested decodes cannot change live outputs.
+    out_vector_buffer.swap(recycled);
+    scratch = &recycled;
+  }
+  auto recycle = ailego::ScopeGuard::Make([&]() {
+    if (scratch && out_vector_buffer.capacity() <= scratch_limit &&
+        out_vector_buffer.capacity() > scratch->capacity())
+      out_vector_buffer.swap(*scratch);
+  });
   if (turbo_quantizer_ != nullptr) {
     // Decode the quantizer's stored layout back to the original vector format.
     if (turbo_quantizer_->dequantize(vector, streamer_vector_meta_,
@@ -862,17 +883,21 @@ int Index::_dense_fetch(const uint32_t doc_id,
       return core::IndexError_Runtime;
     }
   } else if (reformer_ != nullptr) {
+    out_vector_buffer.resize(input_vector_meta_.element_size());
     if (reformer_->revert(vector, streamer_vector_meta_, &out_vector_buffer) !=
         0) {
       LOG_ERROR("Failed to convert vector");
       return core::IndexError_Runtime;
     }
   } else {
-    out_vector_buffer = std::string(
+    out_vector_buffer.assign(
         static_cast<const char *>(vector),
         input_vector_meta_.dimension() * input_vector_meta_.unit_size());
   }
-  vector_data_buffer->vector_buffer = std::move(dense_vector_buffer);
+  if (scratch)
+    previous->data.swap(out_vector_buffer);
+  else
+    vector_data_buffer->vector_buffer = std::move(dense_vector_buffer);
   return 0;
 }
 

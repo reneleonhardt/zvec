@@ -200,6 +200,22 @@ TEST(Fp32Quantizer, General) {
   }
 }
 
+TEST(Fp32Quantizer, DequantizeSizesAndOverwritesOutput) {
+  const uint32_t bits[] = {0, 0x80000000, 0x3f800001, 0x7fc01234,
+                           0x7f800000, 0xff800000};
+  IndexMeta meta(IndexMeta::DT_FP32, 6);
+  meta.set_metric("SquaredEuclidean", 0, Params());
+  auto quantizer = IndexFactory::CreateQuantizer("Fp32Quantizer");
+  ASSERT_EQ(0, quantizer->init(meta, Params()));
+  for (size_t initial : {0U, 1U, 128U}) {
+    std::string result(initial, 'x');
+    ASSERT_EQ(0, quantizer->dequantize(
+                     bits, IndexQueryMeta(IndexMeta::DT_FP32, 6), &result));
+    ASSERT_EQ(sizeof(bits), result.size());
+    EXPECT_EQ(0, std::memcmp(bits, result.data(), sizeof(bits)));
+  }
+}
+
 TEST(Fp32Quantizer, Score) {
   std::mt19937 gen(42);
   std::uniform_real_distribution<float> dist(0.0, 1.0);

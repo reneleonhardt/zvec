@@ -87,6 +87,9 @@ class IVFStreamer : public IndexStreamer {
   //! Create a new iterator
   IndexProvider::Pointer create_provider() const override;
 
+  int fetch_vector(uint64_t key, Context::Pointer &context,
+                   std::string &vector) const;
+
   //! Retrieve meta of index
   const IndexMeta &meta() const override {
     return meta_;

@@ -32,6 +32,37 @@
 
 using namespace zvec;
 
+TEST(VectorColumnIndexerTest, FetchBufferConversionTransfersOwnership) {
+  core_interface::VectorDataBuffer input;
+  input.vector_buffer = core_interface::DenseVectorBuffer{std::string(256, 'd')};
+  const auto *dense_data =
+      std::get<core_interface::DenseVectorBuffer>(input.vector_buffer).data.data();
+  auto dense = ProximaEngineHelper::move_from_engine_vector_buffer(
+      std::move(input), false);
+  ASSERT_TRUE(dense);
+  const auto &output =
+      std::get<vector_column_params::DenseVectorBuffer>(dense->vector_buffer);
+  EXPECT_EQ(dense_data, output.data.data());
+  EXPECT_EQ(std::string(256, 'd'), output.data);
+
+  input.vector_buffer = core_interface::SparseVectorBuffer{
+      64, std::string(256, 'i'), std::string(256, 'v')};
+  const auto &source =
+      std::get<core_interface::SparseVectorBuffer>(input.vector_buffer);
+  const auto *indices = source.indices.data();
+  const auto *values = source.values.data();
+  auto sparse = ProximaEngineHelper::move_from_engine_vector_buffer(
+      std::move(input), true);
+  ASSERT_TRUE(sparse);
+  const auto &result =
+      std::get<vector_column_params::SparseVectorBuffer>(sparse->vector_buffer);
+  EXPECT_EQ(indices, result.indices.data());
+  EXPECT_EQ(values, result.values.data());
+  EXPECT_EQ(64U, result.count());
+  EXPECT_EQ(std::string(256, 'i'), result.indices);
+  EXPECT_EQ(std::string(256, 'v'), result.values);
+}
+
 
 TEST(VectorColumnIndexerTest, ReusedQueryParametersAndFlatFallback) {
   FieldSchema field("vector", DataType::VECTOR_FP32, 32, false,

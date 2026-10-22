@@ -71,14 +71,23 @@ class IVFIndexProvider : public IndexProvider {
   const void *get_vector(uint64_t key) const override {
     try {
       auto &buffer = thread_result_buffer();
-      std::lock_guard<std::mutex> lock(*read_mutex_);
-      IndexStorage::MemoryBlock data;
-      if (entity_->get_vector_by_key(key, data) != 0) {
-        return nullptr;
-      }
-      return CopyVector(entity_, data.data(), element_size(), &buffer);
+      return copy_vector(key, &buffer) == 0 ? buffer.data() : nullptr;
     } catch (const std::bad_alloc &) {
       return nullptr;
+    }
+  }
+
+  int copy_vector(uint64_t key, std::string *buffer) const {
+    try {
+      std::lock_guard<std::mutex> lock(*read_mutex_);
+      IndexStorage::MemoryBlock data;
+      if (entity_->get_vector_by_key(key, data) != 0 ||
+          !CopyVector(entity_, data.data(), element_size(), buffer)) {
+        return IndexError_NoExist;
+      }
+      return 0;
+    } catch (const std::bad_alloc &) {
+      return IndexError_NoExist;
     }
   }
 

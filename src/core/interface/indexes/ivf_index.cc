@@ -371,13 +371,11 @@ int IVFIndex::_dense_fetch(const uint32_t doc_id,
                            VectorDataBuffer *vector_data_buffer) {
   if (is_trained_) {
     if (ivf_quantizer_) {
-      auto provider = streamer_->create_provider();
-      if (!provider) return core::IndexError_NoReady;
-      const void *vector = provider->get_vector(doc_id);
-      if (!vector) return core::IndexError_NoExist;
+      auto &context = acquire_context();
       DenseVectorBuffer buffer;
-      buffer.data.assign(static_cast<const char *>(vector),
-                         input_vector_meta_.element_size());
+      auto *streamer = static_cast<core::IVFStreamer *>(streamer_.get());
+      const int ret = streamer->fetch_vector(doc_id, context, buffer.data);
+      if (ret != 0) return ret;
       vector_data_buffer->vector_buffer = std::move(buffer);
       return 0;
     }

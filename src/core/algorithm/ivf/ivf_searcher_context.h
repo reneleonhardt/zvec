@@ -134,6 +134,10 @@ class IVFSearcherContext : public IndexSearcher::Context {
     return entity_;
   }
 
+  IndexProvider::Pointer &fetch_provider() {
+    return fetch_provider_;
+  }
+
   //! Retrieve Mutable Query Result By Query Index
   IndexDocumentHeap &mutable_result_heap() {
     return result_heap_;
@@ -165,6 +169,7 @@ class IVFSearcherContext : public IndexSearcher::Context {
                      IndexSearcher::Context::Pointer &centroid_ctx,
                      const ailego::Params &params, uint32_t magic_num) {
     entity_ = new_entity;
+    fetch_provider_.reset();
     centroid_searcher_ctx_ = std::move(centroid_ctx);
     int ret = this->update(params);
     ivf_check_error_code(ret);
@@ -222,6 +227,7 @@ class IVFSearcherContext : public IndexSearcher::Context {
 
   //! Members
   IVFEntity::Pointer entity_{};
+  IndexProvider::Pointer fetch_provider_{};
   IndexSearcher::Context::Pointer centroid_searcher_ctx_{};
   IndexDocumentHeap result_heap_;
   std::vector<IndexDocumentList> results_{};

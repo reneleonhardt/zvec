@@ -109,8 +109,7 @@ int Fp32Quantizer::dequantize(const void *in, const IndexQueryMeta &qmeta,
       out_buf[i] = in_buf[i] * norm;
     }
   } else {
-    out->resize(byte_size);
-    std::memcpy(out->data(), in, byte_size);
+    out->assign(static_cast<const char *>(in), byte_size);
   }
   return 0;
 }
