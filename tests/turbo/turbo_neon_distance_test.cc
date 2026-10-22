@@ -205,7 +205,12 @@ TEST(NeonDistance, Fp32SplitDotPreservesPointBits) {
       std::fill(rows[6].begin(), rows[6].end(),
                 std::numeric_limits<float>::max() / 4);
       std::vector<SplitVector> spans(9);
-      for (size_t prefix = 0; prefix <= dim; ++prefix) {
+      for (size_t boundary = 0; boundary < 2 * (dim + 1); ++boundary) {
+        const size_t prefix = boundary % (dim + 1);
+        if (boundary == dim + 1) {
+          const uint32_t query_nans[] = {0x7fc54321, 0x7fa54321, 0xffc54321};
+          std::memcpy(query.data() + 3, query_nans, sizeof(query_nans));
+        }
         for (size_t row = 0; row < rows.size(); ++row) {
           size_t cut = (prefix + row * 3) % (dim + 1);
           std::fill(first[row].begin(), first[row].end(), 99.f);

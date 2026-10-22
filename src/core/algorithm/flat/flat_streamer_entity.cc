@@ -684,14 +684,15 @@ void FlatStreamerEntity::prefault_cold_mmap(const void *const *vectors,
 bool FlatStreamerEntity::try_bounded_distances(
     const void *query, const void *const *vectors, size_t count, float *distances,
     FlatSearchScratch *scratch, const IndexDocumentHeap *heap) const {
-  if (!split_distance_ || index_meta_.metric_name() != "SquaredEuclidean" ||
-      !scratch || count < 4 || index_meta_.dimension() <= 64 || !heap->full() ||
-      heap->empty())
+  if (!split_distance_ || !scratch || count < 4 ||
+      index_meta_.dimension() <= 64 || !heap->full() || heap->empty())
     return false;
 #if defined(__APPLE__)
+  // Full dot-product batches also share these initial page faults.
   if (mmap_prefault_state_.load(std::memory_order_relaxed) != MmapPrefaultState::Done)
     prefault_cold_mmap(vectors, count);
 #endif
+  if (index_meta_.metric_name() != "SquaredEuclidean") return false;
   auto &spans = scratch->split_vectors;
   spans.clear();
   spans.reserve(count);
