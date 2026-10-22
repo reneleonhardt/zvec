@@ -13,7 +13,7 @@ path = root / 'fixture.bin'
 if path.exists():
     raise SystemExit('Fixture already exists; preserve the fixed baseline input')
 rng = random.Random(421421)
-count, dimension, query_count, clusters = int(os.environ.get("PERF_FIXTURE_COUNT", "8193")), 768, 64, 64
+count, dimension, query_count, clusters = int(os.environ.get("PERF_FIXTURE_COUNT", "8193")), int(os.environ.get("PERF_FIXTURE_DIM", "768")), 64, 64
 scales = [1 / math.sqrt(1 + d / 48) for d in range(dimension)]
 bias = [rng.gauss(0, .35) * scale for scale in scales]
 centers = [[rng.gauss(0, 1) * scale for scale in scales] for _ in range(clusters)]

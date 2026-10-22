@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 180
     env:
       BASELINE_SHA: 8d4996924bce78f8b072a353803c305101bcc807
-      BEFORE_SHA: 7d3c08f193fb66737144bbc3efa21d5a5a778a31
+      BEFORE_SHA: 0659259a7fae0f5d0fec5337e82a37b975db7a6a
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
       CCACHE_MAXSIZE: 3G
@@ -77,6 +77,11 @@ jobs:
           path: .ccache-vector-perf
           key: vector-perf-2604-gcc-${{ runner.arch }}-${{ github.sha }}
           restore-keys: vector-perf-2604-gcc-${{ runner.arch }}-
+      - uses: actions/cache/restore@v6
+        id: candidate-reference
+        with:
+          path: bench-candidate
+          key: vector-perf-candidate-v1-${{ runner.arch }}-${{ steps.toolchain.outputs.key }}-${{ github.sha }}
       - name: Build frozen references
         run: |
           set -euo pipefail
@@ -116,23 +121,48 @@ jobs:
         with:
           path: bench-before
           key: ${{ steps.before-reference.outputs.cache-primary-key }}
-      - name: Build candidate and validate arithmetic before timing
+      - name: Restore candidate and build uncached binaries
         run: |
           set -euo pipefail
           git -C candidate checkout --detach "$GITHUB_SHA"
           git -C candidate submodule update --init --recursive
-          nice -n 10 cmake -S benchmark-harness -B bench-build -G Ninja \
+          if [[ '${{ steps.candidate-reference.outputs.cache-hit }}' == 'true' ]]; then
+            echo "Reusing candidate executables and original-symbol proof"
+            exit 0
+          fi
+          nice -n 10 cmake -S benchmark-harness -B build-candidate -G Ninja \
             -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE/candidate" -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          nice -n 10 cmake --build bench-build --target vector_system_search vector_pool_workloads vector_alloc_probe turbo_avx2_distance_test turbo_fp16_quantizer_test --parallel 4
+          nice -n 10 cmake --build build-candidate --target vector_system_search vector_pool_workloads vector_alloc_probe turbo_avx2_distance_test turbo_fp16_quantizer_test --parallel 4
           mkdir bench-candidate
-          cp bench-build/vector_system_search bench-build/vector_pool_workloads bench-build/libvector_alloc_probe.so bench-candidate/
+          cp build-candidate/vector_system_search build-candidate/vector_pool_workloads build-candidate/libvector_alloc_probe.so \
+            build-candidate/zvec/bin/turbo_avx2_distance_test build-candidate/zvec/bin/turbo_fp16_quantizer_test bench-candidate/
           echo "$GITHUB_SHA" > bench-candidate/source-sha.txt
-          ldd bench-candidate/vector_system_search > results/candidate-libraries.txt
-          if grep -q '/bench-build/' results/candidate-libraries.txt; then exit 1; fi
-          nice -n 10 bench-build/zvec/bin/turbo_avx2_distance_test > results/arithmetic-check.txt 2>&1
-          nice -n 10 bench-build/zvec/bin/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization >> results/arithmetic-check.txt 2>&1
+          nice -n 10 python3 benchmark-harness/exact_bits.py \
+            --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$BEFORE_SHA" \
+            --build-root "$GITHUB_WORKSPACE/build-candidate" \
+            --output "$GITHUB_WORKSPACE/bench-candidate/exact-bits" --build-only \
+            > results/original-symbol-build.txt 2>&1
+      - name: Validate cached candidate on this CPU before timing
+        run: |
+          set -euo pipefail
+          test "$(cat bench-candidate/source-sha.txt)" = "$GITHUB_SHA"
+          for binary in vector_system_search vector_pool_workloads turbo_avx2_distance_test turbo_fp16_quantizer_test exact-bits; do
+            test -x "bench-candidate/$binary"
+            ldd "bench-candidate/$binary" >> results/candidate-libraries.txt
+          done
+          test -f bench-candidate/libvector_alloc_probe.so
+          if grep -Eq '/(bench-build|build-candidate)/' results/candidate-libraries.txt; then exit 1; fi
+          nice -n 10 bench-candidate/turbo_avx2_distance_test > results/arithmetic-check.txt 2>&1
+          nice -n 10 bench-candidate/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.CosineDecodePreservesBitsAndExceptionFlags:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization >> results/arithmetic-check.txt 2>&1
+          printf 'Frozen source: %s; candidate: %s\n' "$BEFORE_SHA" "$GITHUB_SHA" > results/original-symbol-check.txt
+          nice -n 10 bench-candidate/exact-bits >> results/original-symbol-check.txt 2>&1
           ccache --show-stats > results/ccache.txt
+      - uses: actions/cache/save@v6
+        if: steps.candidate-reference.outputs.cache-hit != 'true'
+        with:
+          path: bench-candidate
+          key: ${{ steps.candidate-reference.outputs.cache-primary-key }}
       - uses: actions/cache/save@v6
         if: always() && steps.build-cache.outputs.cache-hit != 'true'
         with:
@@ -162,7 +192,7 @@ jobs:
           record_profile results/ivf-write.perf \
             bench-candidate/vector_pool_workloads write "$GITHUB_WORKSPACE/results/$profile_arch" ivf bufferpool 8193 20 128 > results/profile-write.csv 2> results/profile-write.log
           "$perf_bin" report -i results/ivf-write.perf --stdio > results/ivf-write-profile.txt
-          for kind in flat fp16 raw16 physical; do
+          for kind in flat fp16 raw16 physical cos32 ip32; do
             record_profile "results/$kind-search.perf" \
               bench-candidate/vector_system_search warm "$GITHUB_WORKSPACE/results/auto" "$kind" bufferpool 0 1 8 1 > "results/profile-$kind.csv" 2> "results/profile-$kind.log"
             "$perf_bin" report -i "results/$kind-search.perf" --stdio > "results/$kind-search-profile.txt"
