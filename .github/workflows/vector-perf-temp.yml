@@ -134,9 +134,10 @@ jobs:
             -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE/candidate" -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           nice -n 10 cmake --build build-candidate --target vector_system_search vector_pool_workloads vector_alloc_probe turbo_avx2_distance_test turbo_fp16_quantizer_test --parallel 4
-          mkdir bench-candidate
+          mkdir -p bench-candidate/lib
           cp build-candidate/vector_system_search build-candidate/vector_pool_workloads build-candidate/libvector_alloc_probe.so \
             build-candidate/zvec/bin/turbo_avx2_distance_test build-candidate/zvec/bin/turbo_fp16_quantizer_test bench-candidate/
+          cp build-candidate/zvec/lib/libcore_metric.so build-candidate/zvec/lib/libcore_quantizer.so bench-candidate/lib/
           echo "$GITHUB_SHA" > bench-candidate/source-sha.txt
           nice -n 10 python3 benchmark-harness/exact_bits.py \
             --source-root "$GITHUB_WORKSPACE/candidate" --source-ref "$BEFORE_SHA" \
@@ -147,12 +148,13 @@ jobs:
         run: |
           set -euo pipefail
           test "$(cat bench-candidate/source-sha.txt)" = "$GITHUB_SHA"
+          export LD_LIBRARY_PATH="$GITHUB_WORKSPACE/bench-candidate/lib"
           for binary in vector_system_search vector_pool_workloads turbo_avx2_distance_test turbo_fp16_quantizer_test exact-bits; do
             test -x "bench-candidate/$binary"
             ldd "bench-candidate/$binary" >> results/candidate-libraries.txt
           done
           test -f bench-candidate/libvector_alloc_probe.so
-          if grep -Eq '/(bench-build|build-candidate)/' results/candidate-libraries.txt; then exit 1; fi
+          if grep -Eq '/(bench-build|build-candidate)/|not found' results/candidate-libraries.txt; then exit 1; fi
           nice -n 10 bench-candidate/turbo_avx2_distance_test > results/arithmetic-check.txt 2>&1
           nice -n 10 bench-candidate/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.CosineDecodePreservesBitsAndExceptionFlags:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization >> results/arithmetic-check.txt 2>&1
           printf 'Frozen source: %s; candidate: %s\n' "$BEFORE_SHA" "$GITHUB_SHA" > results/original-symbol-check.txt
