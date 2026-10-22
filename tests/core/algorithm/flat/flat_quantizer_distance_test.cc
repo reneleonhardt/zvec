@@ -158,14 +158,14 @@ TEST(FlatQuantizerDistance, RawFp16L2AccumulatesInFp32) {
 
 namespace {
 template <IndexMeta::DataType Type, typename T>
-void CheckEncodedSearcher(const char *metric_name,
-                          IndexMeta::MajorOrder order) {
+void CheckEncodedSearcher(const char *metric_name, IndexMeta::MajorOrder order,
+                          size_t dimension = 17) {
   SCOPED_TRACE(std::string(metric_name) + " type=" + std::to_string(Type) +
                " order=" + std::to_string(order));
   const bool cosine = std::string(metric_name) == "Cosine";
   // The FP32 norm occupies two FP16 elements or one FP32 element.
   constexpr size_t norm_elements = Type == IndexMeta::DT_FP16 ? 2 : 1;
-  const size_t dim = 17 + (cosine ? norm_elements : 0);
+  const size_t dim = dimension + (cosine ? norm_elements : 0);
   const std::string path = "flat_encoded_centers.index";
   struct Cleanup {
     std::string path;
@@ -185,6 +185,9 @@ void CheckEncodedSearcher(const char *metric_name,
     ailego::NumericalVector<T> row(dim);
     for (size_t d = 0; d < dim; ++d) {
       row[d] = static_cast<T>((i + 1) * 0.03125f + d * 0.015625f);
+      if (dimension != 17)
+        row[d] = static_cast<T>(
+            float(int((i * d * 7 + i * 31 + d * 11) % 997) - 498) * .0031f);
     }
     if (i == 2 || i == 17 || i == 34) {
       queries.insert(queries.end(), row.data(), row.data() + dim);
@@ -233,7 +236,8 @@ void CheckEncodedSearcher(const char *metric_name,
     reference->set_topk(6);
     actual->set_topk(6);
     IndexQueryMeta query_meta(Type, dim);
-    for (uint32_t count : {1U, 3U}) {
+    std::vector<std::pair<uint64_t, float>> single;
+    for (uint32_t count : {1U, 3U, 1U}) {
       ASSERT_EQ(
           0, legacy->search_impl(queries.data(), query_meta, count, reference));
       ASSERT_EQ(
@@ -251,6 +255,13 @@ void CheckEncodedSearcher(const char *metric_name,
                   ? 1e-3f * std::max(1.0f, std::abs(expected[k].score()))
                   : 1e-4f;
           EXPECT_NEAR(expected[k].score(), result[k].score(), tolerance);
+          if (j == 0 && dimension != 17) {
+            if (count == 1 && single.size() <= k)
+              single.emplace_back(result[k].key(), result[k].score());
+            EXPECT_EQ(single[k].first, result[k].key());
+            const float score = result[k].score();
+            EXPECT_EQ(0, std::memcmp(&single[k].second, &score, sizeof(float)));
+          }
         }
       }
     }
@@ -267,6 +278,9 @@ void CheckEncodedSearcher(const char *metric_name,
 }  // namespace
 
 TEST(FlatQuantizerDistance, EncodedFp32SearcherMatchesLegacyAndReopens) {
+  for (size_t dimension : {32U, 768U})
+    CheckEncodedSearcher<IndexMeta::DT_FP32, float>(
+        "SquaredEuclidean", IndexMeta::MO_ROW, dimension);
   for (auto order : {IndexMeta::MO_ROW, IndexMeta::MO_COLUMN}) {
     for (const auto *metric : {"SquaredEuclidean", "InnerProduct", "Cosine"}) {
       CheckEncodedSearcher<IndexMeta::DT_FP32, float>(metric, order);

@@ -228,6 +228,16 @@ class FlatSearcherContext : public IndexSearcher::Context {
 
   //! Similarity search
   int search_row(const void *query, const IndexQueryMeta &qmeta, size_t count) {
+#if defined(AILEGO_ARM64_NEON)
+    if (count == 1 && !this->filter().is_valid() && quantizer_ &&
+        quantizer_->type() == turbo::QuantizeType::kFp32 &&
+        owner_->meta().data_type() == IndexMeta::DT_FP32 &&
+        owner_->meta().metric_name() == "SquaredEuclidean" &&
+        qmeta.dimension() % 32 == 0) {
+      result_heaps_.resize(1);
+      return this->search_row_nofilter(query, qmeta);
+    }
+#endif
     return (this->filter().is_valid()
                 ? this->batch_search_row_filter(query, qmeta, count)
                 : this->batch_search_row_nofilter(query, qmeta, count));
