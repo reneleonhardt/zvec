@@ -12,14 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 #include <algorithm>
+#include <cfenv>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <random>
 #include <string>
 #include <utility>
 #include <vector>
+#include <ailego/pattern/scope_guard.h>
 #include <gtest/gtest.h>
 #include <turbo/quantizer/quantizer.h>
+#include <zvec/ailego/buffer/block_eviction_queue.h>
 #include <zvec/core/framework/index_error.h>
 #include <zvec/core/framework/index_framework.h>
 #include <zvec/core/framework/index_streamer.h>
@@ -298,6 +302,75 @@ INSTANTIATE_TEST_SUITE_P(
     [](const testing::TestParamInfo<FlatTurboTestCase> &info) {
       return info.param.name();
     });
+
+TEST(FlatTurboIndex, BufferPoolPreservesSingleRowTailBits) {
+  const std::string path = "flat_turbo_tail.index";
+  auto &pool = zvec::ailego::MemoryLimitPool::get_instance();
+  const auto capacity = pool.capacity();
+  const int rounding = std::fegetround();
+  ASSERT_EQ(0, pool.init(64UL * 1024 * 1024));
+  auto cleanup = zvec::ailego::ScopeGuard::Make([&]() {
+    std::fesetround(rounding);
+    zvec::test_util::RemoveTestFiles(path);
+    EXPECT_EQ(0, pool.init(capacity));
+  });
+  const auto vectors = RandomVectors(33, 768);
+  for (auto metric :
+       {MetricType::kL2sq, MetricType::kInnerProduct, MetricType::kCosine}) {
+    zvec::test_util::RemoveTestFiles(path);
+    auto param = FlatIndexParamBuilder()
+                     .with_metric_type(metric)
+                     .with_data_type(DataType::DT_FP32)
+                     .with_dimension(768)
+                     .build();
+    auto mapped = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_NE(nullptr, mapped);
+    ASSERT_EQ(0,
+              mapped->open(path, {StorageOptions::StorageType::kMMAP, true}));
+    for (size_t i = 0; i < vectors.size(); ++i) {
+      VectorData data;
+      data.vector = DenseVector{vectors[i].data()};
+      ASSERT_EQ(0, mapped->add(data, i));
+    }
+    ASSERT_EQ(0, mapped->train());
+    ASSERT_EQ(0, mapped->close());
+    ASSERT_EQ(0,
+              mapped->open(path, {StorageOptions::StorageType::kMMAP, false}));
+    auto pooled = IndexFactory::CreateAndInitIndex(*param);
+    ASSERT_NE(nullptr, pooled);
+    ASSERT_EQ(0, pooled->open(
+                     path, {StorageOptions::StorageType::kBufferPool, false}));
+    for (int mode : {FE_TONEAREST, FE_UPWARD}) {
+      ASSERT_EQ(0, std::fesetround(mode));
+      for (bool filtered : {false, true}) {
+        auto query = FlatQueryParamBuilder().with_topk(33).build();
+        if (filtered) {
+          query->filter = std::make_shared<IndexFilter>();
+          query->filter->set([](uint64_t) { return false; });
+        }
+        VectorData data;
+        data.vector = DenseVector{vectors[7].data()};
+        SearchResult expected;
+        ASSERT_EQ(0, mapped->search(data, query, &expected));
+        ASSERT_EQ(vectors.size(), expected.doc_list_.size());
+        for (int pass = 0; pass < 2; ++pass) {
+          SearchResult actual;
+          ASSERT_EQ(0, pooled->search(data, query, &actual));
+          ASSERT_EQ(expected.doc_list_.size(), actual.doc_list_.size());
+          for (size_t i = 0; i < actual.doc_list_.size(); ++i) {
+            EXPECT_EQ(expected.doc_list_[i].key(), actual.doc_list_[i].key());
+            const float a = actual.doc_list_[i].score();
+            const float b = expected.doc_list_[i].score();
+            EXPECT_EQ(0, std::memcmp(&a, &b, sizeof(a)));
+          }
+        }
+      }
+    }
+    ASSERT_EQ(0, std::fesetround(rounding));
+    ASSERT_EQ(0, pooled->close());
+    ASSERT_EQ(0, mapped->close());
+  }
+}
 
 TEST(FlatTurboRadius, InnerProductUsesCallerScoreSpace) {
   // Binary fractions are exact in both FP32 and FP16. The oracle is the

@@ -580,7 +580,10 @@ int FlatStreamerEntity::search_borrowed_block(
 #endif
   auto &pointers = scratch->vector_ptrs;
   pointers.clear();
-  if (resident && split_distance_) {
+  // An unfiltered single-row block uses the point kernel in the owned path.
+  const bool point_distance = header->vector_count == 1 && !filter.is_valid() &&
+                              !deletion_map->is_dirty();
+  if (resident && split_distance_ && !point_distance) {
     auto &vectors = scratch->split_vectors;
     vectors.clear();
     vectors.reserve(header->vector_count);
@@ -655,8 +658,10 @@ int FlatStreamerEntity::search_borrowed_block(
   }
   auto *distances = scratch->distances.data();
   if (quantizer_) {
-    if (!try_bounded_distances(query, pointers.data(), pointers.size(), distances,
-                                scratch, heap))
+    if (point_distance)
+      distances[0] = quantizer_->calc_distance_dp_query(pointers[0], query);
+    else if (!try_bounded_distances(query, pointers.data(), pointers.size(),
+                                   distances, scratch, heap))
       quantizer_->calc_distance_dp_query_batch(
           pointers.data(), static_cast<int>(pointers.size()), query, distances);
   } else {
