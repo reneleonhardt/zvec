@@ -11,6 +11,9 @@ import tempfile
 
 KERNELS = [
     ("avx2", "fp32/inner_product", "inner_product_fp32_batch_distance_avx2", False),
+    ("avx2", "fp32/squared_euclidean", "squared_euclidean_fp32_batch_distance_avx2", False),
+    ("avx2", "fp16/inner_product", "inner_product_fp16_batch_distance_avx2", True),
+    ("avx2", "fp16/squared_euclidean", "squared_euclidean_fp16_batch_distance_avx2", True),
     ("avx512", "fp32/inner_product", "inner_product_fp32_batch_distance_avx512", False),
     ("avx512", "fp32/squared_euclidean", "squared_euclidean_fp32_batch_distance_avx512", False),
     ("avx512", "fp16/inner_product", "inner_product_fp16_batch_distance_avx512", True),
@@ -240,6 +243,7 @@ def main():
     parser.add_argument("--avx512-march", default="icelake-server")
     parser.add_argument("--output", type=Path, help="Keep the compiled proof binary at this path")
     parser.add_argument("--build-only", action="store_true", help="Compile without executing (requires --output)")
+    parser.add_argument("--distance-only", action="store_true", help="Skip decoder proof for references predating the decoder")
     args = parser.parse_args()
     if args.build_only and args.output is None:
         parser.error("--build-only requires --output")
@@ -262,6 +266,17 @@ def main():
     declarations, checks = [], []
     with tempfile.TemporaryDirectory(prefix="zvec-exact-bits-") as directory:
         temporary = Path(directory)
+        # FP16 IP's batch width is defined in this header, not its .cc file.
+        header = "avx2/fp16/inner_product_common.h"
+        source = subprocess.check_output(
+            ["git", "-C", str(root), "show", f"{source_ref}:src/turbo/distance/{header}"], text=True)
+        namespace = "namespace zvec::turbo::avx2 {"
+        if source.count(namespace) != 1:
+            raise RuntimeError(f"unexpected namespace in frozen header: {header}")
+        frozen_header = temporary / header
+        frozen_header.parent.mkdir(parents=True)
+        frozen_header.write_text(source.replace(namespace, "namespace zvec::turbo::reference::avx2 {", 1))
+        includes.insert(0, f"-I{temporary}")
         objects = []
         for index, (isa, path, symbol, half) in enumerate(KERNELS):
             filename = f"src/turbo/distance/{isa}/{path}.cc"
@@ -278,19 +293,20 @@ def main():
             for prefix in ("", "reference::"):
                 declarations.append(f"namespace zvec::turbo::{prefix}{isa} {{ void {symbol}(const void *const *, const void *, size_t, size_t, float *, const void *const *); }}")
             checks.append(f'  if ({"avx2" if isa == "avx2" else "avx512"}) {{ ++executed; failures += check<{"uint16_t" if half else "float"}>("{isa}/{path}", zvec::turbo::{isa}::{symbol}, zvec::turbo::reference::{isa}::{symbol}); }} else std::puts("SKIP {isa}/{path}: unavailable CPU features");')
-        filename = "src/turbo/conversion/avx2/cosine_decode.cc"
-        source = subprocess.check_output(["git", "-C", str(root), "show", f"{source_ref}:{filename}"], text=True)
-        namespace = "namespace zvec::turbo::avx2 {"
-        if source.count(namespace) != 1:
-            raise RuntimeError(f"unexpected namespace in frozen source: {filename}")
-        reference, obj = temporary / "reference_decode.cc", temporary / "reference_decode.o"
-        reference.write_text(source.replace(namespace, "namespace zvec::turbo::reference::avx2 {", 1))
-        subprocess.run(compiler + flags + includes + [f"-march={args.avx2_march}", "-c", str(reference), "-o", str(obj)], check=True)
-        objects.append(str(obj))
-        for isa in ("avx2", "avx512", "reference::avx2"):
-            declarations.append(f"namespace zvec::turbo::{isa} {{ bool fp16_cosine_decode(const uint16_t *, size_t, float, float *); }}")
-        for isa in ("avx2", "avx512"):
-            checks.append(f'  if ({isa}) {{ ++executed; failures += check_decode("{isa}/cosine_decode", zvec::turbo::{isa}::fp16_cosine_decode, zvec::turbo::reference::avx2::fp16_cosine_decode); }} else std::puts("SKIP {isa}/cosine_decode: unavailable CPU features");')
+        if not args.distance_only:
+            filename = "src/turbo/conversion/avx2/cosine_decode.cc"
+            source = subprocess.check_output(["git", "-C", str(root), "show", f"{source_ref}:{filename}"], text=True)
+            namespace = "namespace zvec::turbo::avx2 {"
+            if source.count(namespace) != 1:
+                raise RuntimeError(f"unexpected namespace in frozen source: {filename}")
+            reference, obj = temporary / "reference_decode.cc", temporary / "reference_decode.o"
+            reference.write_text(source.replace(namespace, "namespace zvec::turbo::reference::avx2 {", 1))
+            subprocess.run(compiler + flags + includes + [f"-march={args.avx2_march}", "-c", str(reference), "-o", str(obj)], check=True)
+            objects.append(str(obj))
+            for isa in ("avx2", "avx512", "reference::avx2"):
+                declarations.append(f"namespace zvec::turbo::{isa} {{ bool fp16_cosine_decode(const uint16_t *, size_t, float, float *); }}")
+            for isa in ("avx2", "avx512"):
+                checks.append(f'  if ({isa}) {{ ++executed; failures += check_decode("{isa}/cosine_decode", zvec::turbo::{isa}::fp16_cosine_decode, zvec::turbo::reference::avx2::fp16_cosine_decode); }} else std::puts("SKIP {isa}/cosine_decode: unavailable CPU features");')
         driver = temporary / "driver.cc"
         driver.write_text(DRIVER.replace("@DECLARATIONS@", "\n".join(declarations)).replace("@CHECKS@", "\n".join(checks)))
         executable = args.output.resolve() if args.output else temporary / "exact-bits"
