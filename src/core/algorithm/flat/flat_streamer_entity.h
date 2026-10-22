@@ -182,6 +182,10 @@ class FlatStreamerEntity {
     LOG_DEBUG("use_key_info_map_: %d", (int)use_key_info_map_);
   }
 
+  void set_read_only(bool read_only) {
+    read_only_ = read_only;
+  }
+
   //! Set params
   void set_segment_size(uint32_t size) {
     meta_.segment_size = size;
@@ -383,6 +387,7 @@ class FlatStreamerEntity {
     if (!hd_segment) {
       return IndexError_WriteData;
     }
+    std::unique_lock<KeyMapMutex> lock(*key_info_map_lock_);
     if (hd_segment->write(0, &block, sizeof(block)) != sizeof(block)) {
       LOG_ERROR("Failed to write head block location");
       return IndexError_WriteData;
@@ -594,6 +599,7 @@ class FlatStreamerEntity {
   std::vector<uint32_t> withid_key_map_{};
   std::vector<uint64_t> id_key_vector_{};
   bool filter_same_key_{false};
+  bool read_only_{false};
   // Linear metadata only needs rewriting after creation or vector writes.
   bool meta_dirty_{false};
   bool use_key_info_map_{true};

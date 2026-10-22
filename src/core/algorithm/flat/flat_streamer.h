@@ -47,6 +47,10 @@ class FlatStreamer : public IndexStreamer {
   //! Cleanup Streamer
   int cleanup() override;
 
+  void set_read_only(bool read_only) override {
+    read_only_ = read_only;
+  }
+
   //! Create a context
   IndexStreamer::Context::UPointer create_context() const override;
 
@@ -206,6 +210,7 @@ class FlatStreamer : public IndexStreamer {
   bool use_key_info_map_{true};
   uint32_t read_block_size_{0};
   bool use_contiguous_memory_{false};
+  bool read_only_{false};
   std::shared_ptr<zvec::turbo::Quantizer> quantizer_{};
   std::unique_ptr<FlatStreamerEntity> entity_{};
 };

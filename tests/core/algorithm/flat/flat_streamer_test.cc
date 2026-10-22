@@ -20,6 +20,7 @@
 #include <cstdint>
 #include <cstring>
 #include <future>
+#include <functional>
 #include <memory>
 #include <random>
 #include <string>
@@ -57,6 +58,7 @@ namespace {
 template <bool HasBatch>
 class FlatQueryCopyTestMetric : public IndexMetric {
  public:
+  inline static std::function<void()> after_distance;
   int init(const IndexMeta &meta, const Params &params) override {
     metric_ = IndexFactory::CreateMetric("SquaredEuclidean");
     return metric_->init(meta, params);
@@ -72,7 +74,15 @@ class FlatQueryCopyTestMetric : public IndexMetric {
     return metric_->is_matched(meta, query_meta);
   }
   MatrixDistance distance() const override {
-    return metric_->distance();
+    auto distance = metric_->distance();
+    return
+        [distance](const void *a, const void *b, size_t dimension, float *out) {
+          distance(a, b, dimension, out);
+          if (after_distance) {
+            auto callback = std::move(after_distance);
+            callback();
+          }
+        };
   }
   MatrixDistance distance_matrix(size_t m, size_t n) const override {
     return metric_->distance_matrix(m, n);
@@ -1491,6 +1501,64 @@ TEST_F(FlatStreamerTest, TestMultiThread) {
   s1.wait();
   s2.wait();
   s3.wait();
+}
+
+TEST_F(FlatStreamerTest, AppendDuringDistanceKeepsVisitedCount) {
+  auto &pool = MemoryLimitPool::get_instance();
+  const auto capacity = pool.capacity();
+  ASSERT_EQ(0, pool.init(64UL << 20));
+  auto restore = ScopeGuard::Make([&] { EXPECT_EQ(0, pool.init(capacity)); });
+  for (const char *name : {"MMapFileStorage", "BufferStorage"}) {
+    SCOPED_TRACE(name);
+    auto storage = IndexFactory::CreateStorage(name);
+    ASSERT_EQ(0, storage->init(Params()));
+    ASSERT_EQ(0, storage->open(dir_ + name, true));
+    IndexStreamer::Stats stats;
+    FlatStreamerEntity entity(stats);
+    *entity.mutable_meta() = *index_meta_ptr_;
+    entity.mutable_meta()->set_metric("FlatScalarOnlyTest", 0, Params());
+    entity.set_block_vector_count(32);
+    entity.set_linear_list_count(1);
+    ASSERT_EQ(0, entity.open(storage, *entity.mutable_meta()));
+    std::vector<float> row(dim, 1.f), query(dim, 0.f);
+    ASSERT_EQ(0, entity.add(0, row.data(), row.size() * sizeof(float)));
+    auto cleanup = ScopeGuard::Make(
+        [] { zvec::FlatQueryCopyTestMetric<false>::after_distance = {}; });
+    zvec::FlatQueryCopyTestMetric<false>::after_distance = [&] {
+      std::fill(row.begin(), row.end(), 1000.f);
+      EXPECT_EQ(0, entity.add(1, row.data(), row.size() * sizeof(float)));
+    };
+    IndexDocumentHeap heap(1);
+    IndexContext::Stats counters;
+    FlatSearchScratch scratch;
+    uint32_t scanned = 0;
+    ASSERT_EQ(0, entity.search(query.data(), IndexFilter(), &scanned, &heap,
+                               &counters, &scratch, 32));
+    ASSERT_EQ(1U, heap.size());
+    EXPECT_EQ(0U, heap.front().key());
+    EXPECT_EQ(float(dim), heap.front().score());
+    EXPECT_EQ(1U, scanned);
+    ASSERT_EQ(0, entity.flush(0));
+    ASSERT_EQ(0, entity.close());
+    entity.set_read_only(true);
+    ASSERT_EQ(0, entity.open(storage, *entity.mutable_meta()));
+    EXPECT_EQ(IndexError_Unsupported,
+              entity.add(2, row.data(), row.size() * sizeof(float)));
+    EXPECT_EQ(
+        IndexError_Unsupported,
+        entity.add_vector_with_id(0, row.data(), row.size() * sizeof(float)));
+    auto copy = entity.clone();
+    ASSERT_NE(nullptr, copy);
+    EXPECT_EQ(IndexError_Unsupported,
+              copy->add(2, row.data(), row.size() * sizeof(float)));
+    IndexStorage::MemoryBlock original;
+    ASSERT_EQ(0, copy->get_vector_by_key(0, original));
+    EXPECT_EQ(1.f, *static_cast<const float *>(original.data()));
+    original.reset();
+    copy.reset();
+    ASSERT_EQ(0, entity.close());
+    ASSERT_EQ(0, storage->close());
+  }
 }
 
 TEST_F(FlatStreamerTest, TestConcurrentAddAndSearch) {

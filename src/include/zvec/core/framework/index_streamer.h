@@ -70,6 +70,10 @@ class IndexStreamer : public IndexRunner {
 
   //! Retrieve meta of index
   virtual const IndexMeta &meta() const = 0;
+
+  //! Set before open. Implementations may specialize immutable reads and must
+  //! reject their own mutations when using this promise.
+  virtual void set_read_only(bool /*read_only*/) {}
 };
 
 }  // namespace core

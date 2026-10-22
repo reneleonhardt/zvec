@@ -183,6 +183,7 @@ int FlatStreamer<BATCH_SIZE>::open(IndexStorage::Pointer stg) {
   entity_->set_linear_list_count(1);
   entity_->set_use_key_info_map(use_key_info_map_);
   entity_->set_quantizer(quantizer_);
+  entity_->set_read_only(read_only_);
   *entity_->mutable_meta() = meta_;
 
   int ret = entity_->open(std::move(stg), meta_);

@@ -567,6 +567,7 @@ int Index::open(const std::string &file_path, StorageOptions storage_options) {
   if (ret != 0) {
     return ret;
   }
+  if (streamer_) streamer_->set_read_only(storage_options.read_only);
   if (streamer_ == nullptr || streamer_->open(storage_) != 0) {
     LOG_ERROR("Failed to open streamer, path: %s", file_path.c_str());
     return core::IndexError_Runtime;

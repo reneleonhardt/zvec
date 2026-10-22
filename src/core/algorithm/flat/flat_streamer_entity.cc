@@ -309,6 +309,7 @@ int FlatStreamerEntity::flush(uint64_t checkpoint) {
 }
 
 int FlatStreamerEntity::add(uint64_t key, const void *vec, size_t size) {
+  if (read_only_) return IndexError_Unsupported;
   std::lock_guard<std::mutex> lock(mutex_);
   if (filter_same_key_) {
     key_info_map_lock_->lock_shared();
@@ -396,7 +397,13 @@ int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
     return IndexError_ReadData;
   }
 
-  BlockLocation block = *bl;
+  BlockLocation block;
+  if (read_only_) {
+    block = *bl;
+  } else {
+    std::shared_lock<KeyMapMutex> lock(*key_info_map_lock_);
+    block = *bl;
+  }
   // Block readers borrow one owning segment for this scan.
   IndexStorage::Segment::Pointer segment;
   uint32_t segment_id = 0;
@@ -434,6 +441,15 @@ int FlatStreamerEntity::search(const void *query, const IndexFilter &filter,
     if (ailego_unlikely(hd == nullptr)) {
       LOG_ERROR("Failed to get block header");
       return IndexError_ReadData;
+    }
+
+    BlockHeader snapshot;
+    if (!read_only_ && !borrowed_pool_ && segment->base_data()) {
+      // A mapped header can grow during distance evaluation. Publish and read
+      // one count under the lookup lock, then use that snapshot for this visit.
+      std::shared_lock<KeyMapMutex> lock(*key_info_map_lock_);
+      snapshot = *hd;
+      hd = &snapshot;
     }
 
     if (hd->vector_count > 0) {
@@ -842,6 +858,7 @@ FlatStreamerEntity::Pointer FlatStreamerEntity::clone() const {
   entity->withid_key_info_map_ = this->withid_key_info_map_;
   entity->withid_key_map_ = this->withid_key_map_;
   entity->filter_same_key_ = this->filter_same_key_;
+  entity->read_only_ = this->read_only_;
   entity->vec_unit_size_ = this->vec_unit_size_;
   entity->vec_cols_ = this->vec_cols_;
   return FlatStreamerEntity::Pointer(entity);
@@ -1139,11 +1156,11 @@ const void *FlatStreamerEntity::get_vector_by_key(uint64_t key) const {
 int FlatStreamerEntity::get_vector_by_key(
     const uint64_t key, IndexStorage::MemoryBlock &block) const {
   VectorLocation loc{};
-  key_info_map_lock_->lock_shared();
+  std::shared_lock<KeyMapMutex> lock(*key_info_map_lock_, std::defer_lock);
+  if (!read_only_) lock.lock();
   if (use_key_info_map_) {
     auto iterator = key_info_map_.find(key);
     if (iterator == key_info_map_.end()) {
-      key_info_map_lock_->unlock_shared();
       return -1;
     }
     loc = iterator->second;
@@ -1151,11 +1168,10 @@ int FlatStreamerEntity::get_vector_by_key(
     if (key < withid_key_info_map_.size()) {
       loc = withid_key_info_map_[key];
     } else {
-      key_info_map_lock_->unlock_shared();
       return -1;
     }
   }
-  key_info_map_lock_->unlock_shared();
+  if (lock.owns_lock()) lock.unlock();
 
   auto segment = this->get_segment(loc.segment_id);
   if (segment->read(loc.offset, block, index_meta_.element_size()) !=
@@ -1720,18 +1736,17 @@ int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
   BlockHeader hd = *header;
   hd.vector_count += 1;
   size_t hd_off = get_block_header_offset(block.block_index);
+  std::unique_lock<KeyMapMutex> map_lock(*key_info_map_lock_);
   if (segment->write(hd_off, &hd, sizeof(hd)) != sizeof(hd)) {
     LOG_ERROR("Failed to write block header, off=%zu", hd_off);
     return IndexError_WriteData;
   }
 
   VectorLocation loc(block.segment_id, false, vector_off);
-  key_info_map_lock_->lock();
   key_info_map_[key] = loc;
   id_key_vector_.push_back(key);
   withid_key_info_map_.push_back(loc);
   withid_key_map_.push_back(key_off);
-  key_info_map_lock_->unlock();
 
   ++meta_.header.total_vector_count;
   return 0;
@@ -1739,6 +1754,7 @@ int FlatStreamerEntity::add_to_block(const BlockLocation &block, uint64_t key,
 
 int FlatStreamerEntity::add_vector_with_id(const uint32_t id, const void *query,
                                            const uint32_t size) {
+  if (read_only_) return IndexError_Unsupported;
   std::lock_guard<std::mutex> lock(mutex_);
   // if (filter_same_key_) {
   //   key_info_map_lock_->lock_shared();
