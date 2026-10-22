@@ -19,6 +19,10 @@
 #include <ailego/math/normalizer.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/core/framework/index_factory.h>
+#include "avx2/fp16/cosine.h"
+#include "avx2/fp16/inner_product.h"
+#include "avx2/fp16/squared_euclidean.h"
+#include "avx2/split_distance.h"
 #include "neon_fp16/fp16/squared_euclidean.h"
 
 namespace zvec {
@@ -73,6 +77,24 @@ SplitDistanceQuantizer::Distance Fp16Quantizer::split_distance() const {
       *kernel == neon_fp16::squared_euclidean_fp16_distance_neon_fp16 &&
       original_dim_ % 16 == 0)
     return neon_fp16::squared_euclidean_fp16_split_batch_distance;
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+  const auto *point =
+      dp_query_func_
+          .target<decltype(&avx2::squared_euclidean_fp16_distance_avx2)>();
+  const auto *batch = dp_query_batch_func_.target<
+      decltype(&avx2::squared_euclidean_fp16_batch_distance_avx2)>();
+  if (point && batch && original_dim_ % 8 == 0) {
+    if (*point == avx2::squared_euclidean_fp16_distance_avx2 &&
+        *batch == avx2::squared_euclidean_fp16_batch_distance_avx2)
+      return avx2::squared_euclidean_fp16_split_batch;
+    if (*point == avx2::inner_product_fp16_distance_avx2 &&
+        *batch == avx2::inner_product_fp16_batch_distance_avx2)
+      return avx2::inner_product_fp16_split_batch;
+    if (*point == avx2::cosine_fp16_distance_avx2 &&
+        *batch == avx2::cosine_fp16_batch_distance_avx2)
+      return avx2::cosine_fp16_split_batch;
+  }
 #endif
   return nullptr;
 }

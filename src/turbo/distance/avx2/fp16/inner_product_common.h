@@ -256,7 +256,7 @@ inner_product_fp16_batch_avx2_impl(
 static ailego_force_inline void inner_product_fp16_batch_avx2(
     const void *const *vectors, const void *query, size_t n, size_t dim,
     float *distances) {
-  static constexpr size_t batch_size = 2;
+  static constexpr size_t batch_size = 4;
   static constexpr size_t prefetch_step = 2;
   const ailego::Float16 *typed_query =
       reinterpret_cast<const ailego::Float16 *>(query);

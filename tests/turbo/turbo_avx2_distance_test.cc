@@ -1,0 +1,130 @@
+// Copyright 2025-present the zvec project
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+#include <array>
+#include <cfenv>
+#include <cmath>
+#include <cstring>
+#include <limits>
+#include <random>
+#include <vector>
+#include <gtest/gtest.h>
+#include <zvec/ailego/utility/float_helper.h>
+#include "distance/avx2/split_distance.h"
+#include "quantizer/distance.h"
+
+namespace zvec::turbo {
+namespace {
+
+template <typename T>
+void CheckSplits(
+    DataType type, QuantizeType quantize,
+    const std::array<SplitDistanceQuantizer::Distance, 3> &splits) {
+  std::mt19937 generator(7391);
+  std::uniform_real_distribution<float> random(-3.1f, 3.1f);
+  const auto metrics = {MetricType::kSquaredEuclidean,
+                        MetricType::kInnerProduct, MetricType::kCosine};
+  const int rounding = std::fegetround();
+  for (int mode : {FE_TONEAREST, FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+    ASSERT_EQ(0, std::fesetround(mode));
+    for (size_t dim : {8U, 32U, 64U, 96U, 256U, 768U}) {
+      std::vector<T> query(dim), rows(9 * dim);
+      for (auto &value : query) value = static_cast<T>(random(generator));
+      for (auto &value : rows) value = static_cast<T>(random(generator));
+      for (int special : {0, 1, 2}) {
+        if (special) {
+          rows[0] = static_cast<T>(std::numeric_limits<float>::quiet_NaN());
+          rows[dim] = static_cast<T>(std::numeric_limits<float>::infinity());
+          query[dim - 1] = static_cast<T>(-0.0f);
+          if (special == 2) {
+            const uint64_t qnan = sizeof(T) == 4 ? 0x7fc0002a : 0x7e2a;
+            const uint64_t dnan = sizeof(T) == 4 ? 0x7fc00139 : 0x7e39;
+            std::memcpy(query.data(), &qnan, sizeof(T));
+            std::memcpy(rows.data(), &dnan, sizeof(T));
+          }
+        }
+        size_t metric_index = 0;
+        for (auto metric : metrics) {
+          auto kernels =
+              get_distance_kernels(metric, type, quantize, CpuArchType::kAVX2);
+          if (!kernels.batch) {
+            std::fesetround(rounding);
+            GTEST_SKIP();
+          }
+          std::array<float, 9> expected, actual, batched;
+          std::array<const void *, 9> pointers;
+          for (size_t row = 0; row < 9; ++row) {
+            pointers[row] = rows.data() + row * dim;
+            kernels.batch(pointers.data() + row, query.data(), 1, dim,
+                          expected.data() + row, nullptr);
+          }
+          kernels.batch(pointers.data(), query.data(), 9, dim, batched.data(),
+                        nullptr);
+          EXPECT_EQ(0, std::memcmp(expected.data(), batched.data(),
+                                   sizeof(expected)));
+          for (size_t cut : {0UL, 1UL, 7UL, 8UL, dim / 2 + 1, dim - 1, dim}) {
+            std::array<SplitVector, 9> vectors;
+            std::vector<T> suffix(9 * (dim - cut));
+            for (size_t row = 0; row < 9; ++row) {
+              const T *source = rows.data() + row * dim;
+              T *second = suffix.data();
+              if (cut != dim) {
+                second += row * (dim - cut);
+                std::memcpy(second, source + cut, (dim - cut) * sizeof(T));
+              }
+              vectors[row] = {source, second, cut * sizeof(T)};
+            }
+            ASSERT_TRUE(splits[metric_index](vectors.data(), 9, query.data(),
+                                             dim, actual.data(), INFINITY));
+            EXPECT_EQ(0, std::memcmp(expected.data(), actual.data(),
+                                     sizeof(expected)))
+                << "dim=" << dim << " cut=" << cut
+                << " metric=" << metric_index;
+            if (metric_index == 0) {
+              const float cutoff = expected[4];
+              ASSERT_TRUE(splits[0](vectors.data(), 9, query.data(), dim,
+                                    actual.data(), cutoff));
+              for (size_t row = 0; row < 9; ++row) {
+                if (!(std::isinf(actual[row]) && expected[row] >= cutoff)) {
+                  EXPECT_EQ(0, std::memcmp(&expected[row], &actual[row],
+                                           sizeof(float)));
+                }
+              }
+            }
+          }
+          ++metric_index;
+        }
+      }
+    }
+  }
+  ASSERT_EQ(0, std::fesetround(rounding));
+}
+
+TEST(Avx2Distance, SplitAndFourRowBatchesPreserveExistingBatchBits) {
+#if defined(__x86_64__) || defined(_M_X64)
+  CheckSplits<float>(
+      DataType::kFp32, QuantizeType::kFp32,
+      {avx2::squared_euclidean_fp32_split_batch,
+       avx2::inner_product_fp32_split_batch, avx2::cosine_fp32_split_batch});
+  CheckSplits<ailego::Float16>(
+      DataType::kFp16, QuantizeType::kFp16,
+      {avx2::squared_euclidean_fp16_split_batch,
+       avx2::inner_product_fp16_split_batch, avx2::cosine_fp16_split_batch});
+#else
+  GTEST_SKIP() << "AVX2 kernels require x86-64";
+#endif
+}
+
+}  // namespace
+}  // namespace zvec::turbo

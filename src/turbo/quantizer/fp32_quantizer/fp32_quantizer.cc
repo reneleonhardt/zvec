@@ -20,10 +20,14 @@
 #include <zvec/ailego/internal/platform.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/core/framework/index_factory.h>
+#include "avx2/fp32/cosine.h"
+#include "avx2/fp32/inner_product.h"
+#include "avx2/fp32/squared_euclidean.h"
+#include "avx2/split_distance.h"
 #include "core/quantizer/record_quantizer.h"
-#include "neon/fp32/squared_euclidean.h"
-#include "neon/fp32/inner_product.h"
 #include "neon/fp32/cosine.h"
+#include "neon/fp32/inner_product.h"
+#include "neon/fp32/squared_euclidean.h"
 
 namespace zvec {
 namespace turbo {
@@ -158,6 +162,24 @@ SplitDistanceQuantizer::Distance Fp32Quantizer::split_distance() const {
       return neon::inner_product_fp32_split_batch_distance;
     if (*kernel == neon::cosine_fp32_distance)
       return neon::cosine_fp32_split_batch_distance;
+  }
+#endif
+#if defined(__x86_64__) || defined(_M_X64)
+  const auto *point =
+      dp_query_func_
+          .target<decltype(&avx2::squared_euclidean_fp32_distance_avx2)>();
+  const auto *batch = dp_query_batch_func_.target<
+      decltype(&avx2::squared_euclidean_fp32_batch_distance_avx2)>();
+  if (point && batch && original_dim_ % 8 == 0) {
+    if (*point == avx2::squared_euclidean_fp32_distance_avx2 &&
+        *batch == avx2::squared_euclidean_fp32_batch_distance_avx2)
+      return avx2::squared_euclidean_fp32_split_batch;
+    if (*point == avx2::inner_product_fp32_distance_avx2 &&
+        *batch == avx2::inner_product_fp32_batch_distance_avx2)
+      return avx2::inner_product_fp32_split_batch;
+    if (*point == avx2::cosine_fp32_distance_avx2 &&
+        *batch == avx2::cosine_fp32_batch_distance_avx2)
+      return avx2::cosine_fp32_split_batch;
   }
 #endif
   return nullptr;

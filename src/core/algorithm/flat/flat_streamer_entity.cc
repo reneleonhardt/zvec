@@ -217,7 +217,7 @@ int FlatStreamerEntity::open(IndexStorage::Pointer storage,
 
   const auto pool = storage_->vec_buffer_pool();
   if (pool && pool->cache_enabled() && !pool->writable() &&
-      index_meta_.element_size() <= ailego::kVectorPageSize / 4 &&
+      index_meta_.element_size() <= ailego::kVectorPageSize &&
       block_vector_count() * index_meta_.element_size() >
           ailego::kVectorPageSize)
     borrowed_pool_ = pool.get();
