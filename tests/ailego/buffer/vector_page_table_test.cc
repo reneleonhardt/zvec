@@ -1905,6 +1905,46 @@ TEST_F(BufferPoolTest, AioAdmissionUsesFreeCapacityBeforeEviction) {
   EXPECT_TRUE(pool.is_page_resident(2));
   EXPECT_EQ(evictions_before, pool.stats().evict);
 }
+
+TEST_F(BufferPoolTest, DenseClaimedReadsKeepTailAndIndependentPins) {
+  constexpr size_t count = 129;
+  init_vec_pool(/*capacity_pages=*/256, /*file_pages=*/count);
+  VecBufferPool pool(new_file(count, 17), /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  if (!pool.aio_enabled()) GTEST_SKIP() << "no asynchronous backend";
+  auto handle = pool.get_handle();
+  std::array<block_id_t, count> ids;
+  std::array<char *, count> pages{};
+  for (size_t i = 0; i < count; ++i) ids[i] = i;
+  ASSERT_TRUE(handle.acquire_pages(ids.data(), count, pages.data()));
+  for (size_t i = 0; i < count; ++i) {
+    for (size_t j = 0; j < kVectorPageSize; ++j)
+      ASSERT_EQ(static_cast<char>(i + 1 == count && j >= 17 ? 0 : i),
+                pages[i][j]);
+  }
+  EXPECT_EQ(count, pool.stats().miss);
+  EXPECT_LE(pool.stats().aio_pages_submitted, 1U);
+  handle.release_pages(ids.data(), count);
+  for (auto id : ids) EXPECT_TRUE(pool.page_table_.is_released(id));
+}
+
+TEST_F(BufferPoolTest, FailedDenseReadReleasesEveryClaim) {
+  init_vec_pool(/*capacity_pages=*/16, /*file_pages=*/8);
+  const auto file = new_file(8);
+  VecBufferPool pool(file, /*writable=*/false);
+  ASSERT_EQ(0, pool.init());
+  if (!pool.aio_enabled()) GTEST_SKIP() << "no asynchronous backend";
+  ASSERT_EQ(0, ::truncate(file.c_str(), 1));
+  const block_id_t ids[] = {0, 1, 2, 3, 4, 5, 6, 7};
+  char *pages[8]{};
+  EXPECT_FALSE(pool.get_handle().acquire_pages(ids, 8, pages));
+  for (auto id : ids) {
+    EXPECT_FALSE(pool.page_table_.has_residency_activity(id));
+    EXPECT_EQ(VectorPageTable::LoadClaimResult::kClaimed,
+              pool.page_table_.try_claim_block_load(id));
+    EXPECT_TRUE(pool.page_table_.cancel_block_load(id));
+  }
+}
 #endif
 
 // Scattered acquisition is storage-level functionality: it preserves caller

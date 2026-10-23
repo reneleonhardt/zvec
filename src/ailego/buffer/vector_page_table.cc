@@ -24,7 +24,7 @@
 #include <zvec/ailego/buffer/vector_page_table.h>
 #include <zvec/ailego/logger/logger.h>
 #include <zvec/ailego/utility/file_helper.h>
-#if defined(__APPLE__)
+#if defined(__APPLE__) || (defined(__linux__) && !defined(__ANDROID__))
 #include <sys/uio.h>
 #endif
 
@@ -2735,9 +2735,6 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
 #if (defined(__linux__) && !defined(__ANDROID__)) || defined(__APPLE__)
 #if defined(__linux__)
   if (!aio_enabled_) return false;
-  bool use_io_uring = io_backend_type_ == IOBackendType::kIoUring &&
-                      tl_blocking_io_uring.ensure();
-  if (!use_io_uring && !tl_blocking_aio.ensure()) return false;
 #else
   if (writable_) return false;
 #endif
@@ -2836,7 +2833,15 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
     };
 
     std::array<bool, kBlockingAioBatchSize> read_ok{};
-#if defined(__APPLE__)
+#if defined(__linux__)
+    // Dense immutable scans need one read, not one AIO request per page.
+    // Full-page iovecs satisfy O_DIRECT alignment.
+    bool coalesce = !writable_ && allocated > 3 &&
+                    load_pages[allocated - 1] < file_size_ / kVectorPageSize;
+    for (size_t i = 1; coalesce && i < allocated; ++i)
+      coalesce = load_pages[i] == load_pages[i - 1] + 1;
+    if (coalesce) {
+#endif
     // Coalesce consecutive claims directly into their cache frames.
     for (size_t begin = 0; begin < allocated;) {
       size_t end = begin + 1;
@@ -2858,12 +2863,16 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
           continue;
         }
         ssize_t result;
+#if defined(__APPLE__)
         if (__builtin_available(macOS 11.0, *))
+#endif
           result = ::preadv(fd_, vectors.data() + read_index,
                             static_cast<int>(end - begin - read_index), offset);
+#if defined(__APPLE__)
         else
           result = zvec_pread(fd_, vectors[read_index].iov_base,
                               vectors[read_index].iov_len, offset);
+#endif
         if (result < 0 && errno == EINTR) continue;
         if (result <= 0) break;
         offset += result;
@@ -2881,7 +2890,14 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
         std::fill(read_ok.begin() + begin, read_ok.begin() + end, true);
       begin = end;
     }
-#else
+#if defined(__linux__)
+    } else {
+    bool use_io_uring = io_backend_type_ == IOBackendType::kIoUring &&
+                        tl_blocking_io_uring.ensure();
+    if (!use_io_uring && !tl_blocking_aio.ensure()) {
+      abandon_claims(allocated, /*release_buffers=*/true);
+      return false;
+    }
     if (use_io_uring) {
       std::array<IoUringRead, kBlockingAioBatchSize> requests{};
       for (size_t i = 0; i < allocated; ++i) {
@@ -2988,7 +3004,7 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
         }
       }
     }
-
+    }
 #endif
     for (size_t i = 0; i < allocated; ++i) {
       if (buffers[i] == nullptr) continue;
