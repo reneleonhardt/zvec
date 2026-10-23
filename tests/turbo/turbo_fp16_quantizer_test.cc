@@ -31,6 +31,8 @@
 #include <turbo/conversion/avx512/cosine_decode.h>
 #include <turbo/distance/neon_fp16/fp16/cosine.h>
 #include <turbo/quantizer/quantizer.h>
+#include <turbo/quantizer/fp16_quantizer/fp16_quantizer.h>
+#include <turbo/quantizer/fp32_quantizer/fp32_quantizer.h>
 #include <zvec/ailego/container/params.h>
 #include <zvec/ailego/utility/float_helper.h>
 #include <zvec/turbo/turbo.h>
@@ -1071,4 +1073,36 @@ TEST(Fp16Quantizer, AutoDispatchSelectsNeonFp16) {
     ASSERT_TRUE(auto_target);
     EXPECT_EQ(*neon_target, *auto_target);
   }
+}
+
+TEST(Fp16Quantizer, SplitDispatchRequiresIndependentFmaAndF16cFeatures) {
+#if defined(__x86_64__) || defined(_M_X64)
+  auto &flags = internal::CpuFeatures::static_flags_;
+  const auto saved = flags;
+  auto restore = ScopeGuard::Make([&] { flags = saved; });
+  flags.AVX512_VNNI = false;
+  for (unsigned mask = 0; mask < 16; ++mask) {
+    SCOPED_TRACE(mask);
+    const bool wide = mask & 1, fma = mask & 2, f16c = mask & 4;
+    flags.AVX2 = mask & 8;
+    flags.AVX512F = flags.AVX512DQ = flags.AVX512BW = flags.AVX512VL = wide;
+    flags.FMA = fma;
+    flags.F16C = f16c;
+    for (const char *metric : {"SquaredEuclidean", "InnerProduct", "Cosine"}) {
+      IndexMeta meta(IndexMeta::DT_FP32, 32);
+      meta.set_metric(metric, 0, Params());
+      turbo::Fp32Quantizer fp32;
+      turbo::Fp16Quantizer fp16;
+      ASSERT_EQ(0, fp32.init(meta, Params()));
+      ASSERT_EQ(0, fp16.init(meta, Params()));
+      EXPECT_EQ(flags.AVX2 && fma && (!wide || f16c),
+                fp32.split_distance() != nullptr);
+      EXPECT_EQ(flags.AVX2 && fma && f16c &&
+                    (!wide || std::strcmp(metric, "SquaredEuclidean") == 0),
+                fp16.split_distance() != nullptr);
+    }
+  }
+#else
+  GTEST_SKIP() << "x86 dispatch feature selection";
+#endif
 }

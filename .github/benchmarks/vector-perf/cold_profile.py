@@ -79,20 +79,20 @@ def summarize(trace):
     return trials
 
 
-def run(main, before, candidate, output):
+def run(main, before, candidate, output, arch="auto"):
     output = Path(output).resolve()
     results = {}
     for version, directory in (("main", main), ("before", before), ("candidate", candidate)):
         for count in (1, 64):
-            stem = f"cold-ip-{version}-n{count}"
+            stem = f"cold-ip-{version}-n{count}" + ("" if arch == "auto" else f"-{arch}")
             trace = output / (stem + ".trace")
             command = ["strace", "-f", "-ttt", "-T", "-yy", "-s", "128", "-o", str(trace),
                        "-e", "trace=link,linkat,unlink,unlinkat,openat,close,read,pread64,preadv,io_setup,io_submit,io_getevents,io_destroy,io_uring_setup,io_uring_enter,futex,mmap,munmap,madvise,fadvise64,fsync,clock_nanosleep",
-                       str(Path(directory).resolve() / "vector_system_search"), "cold", str(output / "auto"),
+                       str(Path(directory).resolve() / "vector_system_search"), "cold", str(output / arch),
                        "ip32", "bufferpool", "0", str(count), "5"]
             with (output / (stem + ".csv")).open("w") as out, (output / (stem + ".log")).open("w") as err:
                 subprocess.run(command, stdout=out, stderr=err,
-                               env=os.environ | {"VECTOR_PERF_ARCH": "auto"}, check=True)
+                               env=os.environ | {"VECTOR_PERF_ARCH": arch}, check=True)
             lines = trace.read_text().splitlines()
             phases = summarize(lines)
             caller = next(line.split()[0] for line in lines
@@ -104,7 +104,8 @@ def run(main, before, candidate, output):
                 raise ValueError("trace/CSV trial count mismatch")
             results[stem] = [{"benchmark": row, "syscalls": phase, "caller_syscalls": caller_phase}
                              for row, phase, caller_phase in zip(rows, phases, caller_phases)]
-    (output / "cold-ip-syscall-phases.json").write_text(json.dumps(results, indent=2) + "\n")
+    name = "cold-ip-syscall-phases.json" if arch == "auto" else f"cold-ip-{arch}-syscall-phases.json"
+    (output / name).write_text(json.dumps(results, indent=2) + "\n")
 
 
 if __name__ == "__main__":

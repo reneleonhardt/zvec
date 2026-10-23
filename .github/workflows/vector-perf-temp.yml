@@ -232,7 +232,7 @@ jobs:
           if grep -Eq '/(bench-build|build-candidate)/|not found' results/candidate-libraries.txt; then exit 1; fi
           failed=0
           nice -n 10 bench-candidate/turbo_avx2_distance_test > results/arithmetic-check.txt 2>&1 || failed=1
-          nice -n 10 bench-candidate/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.CosineDecodePreservesBitsAndExceptionFlags:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization >> results/arithmetic-check.txt 2>&1 || failed=1
+          nice -n 10 bench-candidate/turbo_fp16_quantizer_test --gtest_filter=Fp16Quantizer.DecodePreservesBitsForEveryHalfEncoding:Fp16Quantizer.CosineDecodePreservesBitsAndExceptionFlags:Fp16Quantizer.StoragePrecisionConvertsBeforeCosineNormalization:Fp16Quantizer.SplitDispatchRequiresIndependentFmaAndF16cFeatures >> results/arithmetic-check.txt 2>&1 || failed=1
           printf 'Frozen decoder source: %s; candidate: %s\n' "$DECODE_REFERENCE_SHA" "$GITHUB_SHA" > results/original-symbol-check.txt
           nice -n 10 bench-candidate/exact-bits >> results/original-symbol-check.txt 2>&1 || failed=1
           printf 'Frozen source: %s; candidate: %s\n' "$BASELINE_SHA" "$GITHUB_SHA" > results/main-symbol-check.txt
@@ -271,6 +271,7 @@ jobs:
               "$perf_bin" record -e cpu-clock:u -g --call-graph dwarf -o "$profile_output" -- "$@"
           }
           python3 benchmark-harness/cold_profile.py bench-main bench-before bench-candidate results
+          python3 benchmark-harness/cold_profile.py bench-main bench-before bench-candidate results avx2
           for version in main before candidate; do
             record_profile "results/$version-ip32-cold.perf" \
               "bench-$version/vector_system_search" cold "$GITHUB_WORKSPACE/results/auto" ip32 bufferpool 0 64 5 > "results/profile-$version-ip32-cold.csv" 2> "results/profile-$version-ip32-cold.log"

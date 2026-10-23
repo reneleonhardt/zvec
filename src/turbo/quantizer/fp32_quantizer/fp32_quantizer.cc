@@ -176,6 +176,7 @@ SplitDistanceQuantizer::Distance Fp32Quantizer::split_distance() const {
   const auto *batch = dp_query_batch_func_.target<
       decltype(&avx2::squared_euclidean_fp32_batch_distance_avx2)>();
   const auto &features = ailego::internal::CpuFeatures::static_flags_;
+  if (!features.AVX2 || !features.FMA) return nullptr;
   const bool avx512_split = features.AVX512DQ && features.AVX512BW &&
                             features.AVX512VL && features.F16C;
   if (avx512_split && point && batch && original_dim_ % 16 == 0) {
