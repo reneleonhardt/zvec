@@ -112,7 +112,7 @@ cpu_flags = Path('/proc/cpuinfo').read_text().lower()
 arches = ('auto', 'avx2') if platform.machine() == 'x86_64' and 'avx512f' in cpu_flags else ('auto',)
 if metadata['suite'] == 'cold-ip':
     for arch in arches:
-        prepare(arch, arch, 'fixture', ('ip32',))
+        prepare(arch, arch, 'fixture', ('ip32', 'flat', 'cos32', 'fp16', 'raw16', 'physical'))
         for name, reference in [('main', main), ('before', before)]:
             for count in (1, 4):
                 compare(arch, name, reference, 'warm', 'ip32', 'bufferpool', count=count)
@@ -121,6 +121,9 @@ if metadata['suite'] == 'cold-ip':
                 for replica in range(2):
                     compare(arch, name, reference, 'cold', 'ip32', 'bufferpool', count=count, replica=replica)
                 compare(arch, name, reference, 'coldalloc', 'ip32', 'bufferpool', count=count)
+            for kind in ('flat', 'cos32', 'fp16', 'raw16', 'physical'):
+                for mode in ('cold', 'coldalloc'):
+                    compare(arch, name, reference, mode, kind, 'bufferpool')
     sys.exit(0)
 if metadata['suite'] == 'dot':
     if len(arches) != 2:

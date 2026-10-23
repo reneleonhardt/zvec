@@ -93,11 +93,17 @@ def run(main, before, candidate, output):
             with (output / (stem + ".csv")).open("w") as out, (output / (stem + ".log")).open("w") as err:
                 subprocess.run(command, stdout=out, stderr=err,
                                env=os.environ | {"VECTOR_PERF_ARCH": "auto"}, check=True)
-            phases = summarize(trace.read_text().splitlines())
+            lines = trace.read_text().splitlines()
+            phases = summarize(lines)
+            caller = next(line.split()[0] for line in lines
+                          if "openat(" in line and '"/proc/self/io"' in line)
+            caller_phases = summarize([line for line in lines
+                                       if line.split() and line.split()[0] == caller])
             rows = list(csv.DictReader((output / (stem + ".csv")).open()))
             if len(rows) != len(phases):
                 raise ValueError("trace/CSV trial count mismatch")
-            results[stem] = [{"benchmark": row, "syscalls": phase} for row, phase in zip(rows, phases)]
+            results[stem] = [{"benchmark": row, "syscalls": phase, "caller_syscalls": caller_phase}
+                             for row, phase, caller_phase in zip(rows, phases, caller_phases)]
     (output / "cold-ip-syscall-phases.json").write_text(json.dumps(results, indent=2) + "\n")
 
 
