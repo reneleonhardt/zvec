@@ -110,7 +110,7 @@ full_suite = metadata['suite'] == 'all'
 storages = ('bufferpool',) if metadata['suite'] == 'storage' else ('mmap', 'bufferpool')
 if metadata['suite'] == 'cold-cosine':
     for arch in arches:
-        prepare(arch, arch, 'fixture', ('cos32',))
+        prepare(arch, arch, 'fixture', ('flat', 'cos32', 'ip32'))
         for name, reference in [('main', main), ('before', before)]:
             for count in (1, 64):
                 for replica in range(3):
