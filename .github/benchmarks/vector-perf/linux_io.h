@@ -17,9 +17,11 @@ inline uint64_t io_counter(const std::string &name) {
 inline uint64_t io_bytes() {
   return io_counter("read_bytes");
 }
-inline int clonefile(const char *source, const char *dest, int) {
-  std::filesystem::copy_file(source, dest);
-  const int fd = open(dest, O_RDWR);
+inline void prepare_cold_index(const char *source, const char *dest) {
+  // Every reader opens a fresh pool. Reuse immutable bytes without generating
+  // a file's worth of writeback immediately before measuring cold reads.
+  require(link(source, dest) == 0);
+  const int fd = open(dest, O_RDONLY);
   require(fd >= 0);
   require(fsync(fd) == 0);
   struct stat info;
@@ -34,5 +36,4 @@ inline int clonefile(const char *source, const char *dest, int) {
   for (auto state : resident) require((state & 1) == 0);
   munmap(mapping, info.st_size);
   close(fd);
-  return 0;
 }

@@ -96,7 +96,7 @@ metadata = {'baseline': os.environ['BASELINE_SHA'], 'before': os.environ['BEFORE
             'allocation_scope': 'caller threads for warm read/search; entire process for cold I/O and writes',
             'cpu_scope': 'entire process', 'suite': os.environ.get('VECTOR_PERF_SUITE', 'affected'), 'fixtures': fixtures,
             'cold_trials': int(os.environ.get('VECTOR_PERF_COLD_TRIALS', '3')),
-            'avx2_scope': 'AVX512 distance dispatch flags masked before initialization; other hardware features remain native', 'cold_scope': 'new file with zero resident Linux page-cache pages before open'}
+            'avx2_scope': 'AVX512 distance dispatch flags masked before initialization; other hardware features remain native', 'cold_scope': 'new pathname and index/pool on an immutable inode; zero resident Linux page-cache pages before open, without payload-copy writeback'}
 for label, directory in [('main', main), ('before', before), ('candidate', candidate)]:
     metadata[label + '_sha256'] = {
         name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
@@ -108,6 +108,18 @@ cpu_flags = Path('/proc/cpuinfo').read_text().lower()
 arches = ('auto', 'avx2') if platform.machine() == 'x86_64' and 'avx512f' in cpu_flags else ('auto',)
 full_suite = metadata['suite'] == 'all'
 storages = ('bufferpool',) if metadata['suite'] == 'storage' else ('mmap', 'bufferpool')
+if metadata['suite'] == 'cold':
+    for arch in arches:
+        prepare(arch, arch, 'fixture', ('flat', 'cos32', 'ip32'))
+        for name, reference in [('main', main), ('before', before)]:
+            for kind in ('flat', 'cos32', 'ip32'):
+                for storage in ('mmap', 'bufferpool'):
+                    for count in (1, 64):
+                        for replica in range(2):
+                            compare(arch, name, reference, 'cold', kind, storage,
+                                    count=count, replica=replica)
+                        compare(arch, name, reference, 'coldalloc', kind, storage, count=count)
+    sys.exit(0)
 for arch in arches:
     prepare(arch, arch, 'fixture', kinds)
     for name, reference in [('main', main), ('before', before)]:

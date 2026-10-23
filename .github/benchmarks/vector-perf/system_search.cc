@@ -109,8 +109,19 @@ int main(int argc, char **argv) {
     }
     if (mode == "clonecheck") {
       const auto path = root + "/clone-test.index";
-      require(clonefile((root + "/flat.index").c_str(), path.c_str(), 0) == 0);
-      require(std::remove(path.c_str()) == 0);
+      for (size_t trial = 0; trial < 3; ++trial) {
+        prepare_cold_index((root + "/flat.index").c_str(), path.c_str());
+        {
+          auto index = open_index(f, path, "flat", "bufferpool");
+          {
+            auto q = query_param("flat", false);
+            ci::SearchResult result;
+            search(*index, f, trial, q, false, result);
+          }
+          require(index->close() == 0);
+        }
+        require(std::remove(path.c_str()) == 0);
+      }
       return 0;
     }
     const bool fetching = mode.rfind("fetch", 0) == 0;
@@ -212,8 +223,7 @@ int main(int argc, char **argv) {
       for (size_t trial = 0; trial < trials; ++trial) {
         const auto clone = root + "/cold-" + std::to_string(getpid()) + "-" +
                            std::to_string(trial) + ".index";
-        require(clonefile((root + "/" + kind + ".index").c_str(), clone.c_str(),
-                          0) == 0);
+        prepare_cold_index((root + "/" + kind + ".index").c_str(), clone.c_str());
         uint64_t io0 = io_bytes();
         auto opened = Clock::now();
         auto open_cpu = std::clock();
