@@ -47,7 +47,8 @@ class IoUringRing;
 
 class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   // Keep every field used by the resident hit/release path in one compact
-  // object, so pinning a page also brings its resident pointer into cache.
+  // object. Each cache line holds several complete entries, so pinning a
+  // page also brings its resident pointer into cache.
   struct alignas(16) Entry {
     std::atomic<char *> buffer{nullptr};
     std::atomic<int> ref_count;
@@ -417,18 +418,13 @@ class ZVEC_AILEGO_API VectorPageTable : public EvictableBlockOwner {
   bool adaptive_priority_enabled_{true};
 
   // Pair with segment_count_ publication before dereferencing a segment.
-  static size_t entry_slot(size_t idx) {
-    const size_t slot = idx & kSegmentMask;
-    // Separate adjacent pin counters without enlarging entries.
-    return (slot & ~size_t{15}) | ((slot & 3) << 2) | ((slot & 12) >> 2);
-  }
   Entry &entry_at(size_t idx) {
     (void)segment_count_.load(std::memory_order_acquire);
-    return segments_[idx >> kSegmentShift][entry_slot(idx)];
+    return segments_[idx >> kSegmentShift][idx & kSegmentMask];
   }
   const Entry &entry_at(size_t idx) const {
     (void)segment_count_.load(std::memory_order_acquire);
-    return segments_[idx >> kSegmentShift][entry_slot(idx)];
+    return segments_[idx >> kSegmentShift][idx & kSegmentMask];
   }
   MetadataEntry &metadata_entry_at(size_t idx) {
     (void)segment_count_.load(std::memory_order_acquire);
