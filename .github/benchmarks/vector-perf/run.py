@@ -108,6 +108,16 @@ cpu_flags = Path('/proc/cpuinfo').read_text().lower()
 arches = ('auto', 'avx2') if platform.machine() == 'x86_64' and 'avx512f' in cpu_flags else ('auto',)
 full_suite = metadata['suite'] == 'all'
 storages = ('bufferpool',) if metadata['suite'] == 'storage' else ('mmap', 'bufferpool')
+if metadata['suite'] == 'cold-cosine':
+    for arch in arches:
+        prepare(arch, arch, 'fixture', ('cos32',))
+        for name, reference in [('main', main), ('before', before)]:
+            for count in (1, 64):
+                for replica in range(3):
+                    compare(arch, name, reference, 'cold', 'cos32', 'bufferpool',
+                            count=count, replica=replica)
+                compare(arch, name, reference, 'coldalloc', 'cos32', 'bufferpool', count=count)
+    sys.exit(0)
 for arch in arches:
     prepare(arch, arch, 'fixture', kinds)
     for name, reference in [('main', main), ('before', before)]:
