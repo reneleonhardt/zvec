@@ -48,6 +48,8 @@ jobs:
           perf --version
           mkdir -p results
           lscpu > results/cpu.txt
+          findmnt -T /tmp > results/filesystems.txt
+          findmnt -T "$GITHUB_WORKSPACE" >> results/filesystems.txt
           uname -a > results/kernel.txt
           cat /etc/os-release > results/os-release.txt
           c++ --version > results/compiler.txt

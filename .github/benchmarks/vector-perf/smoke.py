@@ -5,8 +5,9 @@ import sys
 import tempfile
 
 source = Path(__file__).resolve().parent
-binary = Path(sys.argv[1])
-with tempfile.TemporaryDirectory(prefix='vector-perf-smoke-') as temporary:
+binary = Path(sys.argv[1]).resolve()
+# Cold eviction requires file-backed storage; /tmp may be a tmpfs.
+with tempfile.TemporaryDirectory(prefix='vector-perf-smoke-', dir=binary.parent) as temporary:
     root = Path(temporary)
     env = os.environ | {'PERF_FIXTURE_COUNT': '257'}
     subprocess.run([sys.executable, str(source / 'generate_fixture.py'), str(root)], env=env, check=True)
