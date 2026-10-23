@@ -19,6 +19,8 @@ jobs:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
       CCACHE_MAXSIZE: 3G
+      VECTOR_PERF_SUITE: storage
+      VECTOR_PERF_COLD_TRIALS: 7
     steps:
       - uses: actions/cache/restore@v6
         with:
@@ -218,7 +220,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 benchmark-harness/run.py bench-main bench-before bench-candidate results | tee results/paired.log
-      - name: Profile remaining IVF search and training costs
+      - name: Profile filtered search and cold reads
         if: success()
         run: |
           set -euo pipefail
@@ -232,20 +234,6 @@ jobs:
             "$perf_bin" record -e cycles:u -g --call-graph dwarf -o "$profile_output" -- "$@" ||
               "$perf_bin" record -e cpu-clock:u -g --call-graph dwarf -o "$profile_output" -- "$@"
           }
-          record_profile results/ivf-search.perf \
-            bench-candidate/vector_system_search warm "$GITHUB_WORKSPACE/results/$profile_arch" ivf bufferpool 0 4 8 1 > results/profile-search.csv 2> results/profile-search.log
-          "$perf_bin" report -i results/ivf-search.perf --stdio > results/ivf-search-profile.txt
-          record_profile results/ivf-write.perf \
-            bench-candidate/vector_pool_workloads write "$GITHUB_WORKSPACE/results/$profile_arch" ivf bufferpool 8193 20 128 > results/profile-write.csv 2> results/profile-write.log
-          "$perf_bin" report -i results/ivf-write.perf --stdio > results/ivf-write-profile.txt
-          for kind in flat fp16 raw16 physical cos32 ip32; do
-            record_profile "results/$kind-search.perf" \
-              bench-candidate/vector_system_search warm "$GITHUB_WORKSPACE/results/auto" "$kind" bufferpool 0 1 8 1 > "results/profile-$kind.csv" 2> "results/profile-$kind.log"
-            "$perf_bin" report -i "results/$kind-search.perf" --stdio > "results/$kind-search-profile.txt"
-          done
-          record_profile results/physical-fetch.perf \
-            bench-candidate/vector_system_search fetchwarm "$GITHUB_WORKSPACE/results/auto" physical bufferpool 0 1 8 1 > results/profile-fetch.csv 2> results/profile-fetch.log
-          "$perf_bin" report -i results/physical-fetch.perf --stdio > results/physical-fetch-profile.txt
           for kind in flat cos32 ip32; do
             record_profile "results/$kind-filtered.perf" \
               bench-candidate/vector_system_search warm "$GITHUB_WORKSPACE/results/auto" "$kind" bufferpool 1 1 8 1 > "results/profile-$kind-filtered.csv" 2> "results/profile-$kind-filtered.log"

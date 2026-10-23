@@ -25,8 +25,10 @@ def invoke(exe, args, prefix, env):
     return list(csv.DictReader(prefix.with_suffix('.csv').open()))
 
 
-def compare(arch, reference_name, reference, mode, kind, storage, filtered=0, count=1, reference_arch=None, data_name=None):
+def compare(arch, reference_name, reference, mode, kind, storage, filtered=0, count=1, reference_arch=None, data_name=None, replica=0):
     label = f'{data_name or arch}-{reference_name}-{mode}-{kind}-{storage}-f{filtered}-n{count}'
+    if replica:
+        label += f'-r{replica}'
     rows = [[], []]
     data = output / (data_name or arch)
     env = base_env | {'VECTOR_PERF_ARCH': arch}
@@ -36,7 +38,7 @@ def compare(arch, reference_name, reference, mode, kind, storage, filtered=0, co
         binary = 'vector_pool_workloads'
     else:
         args = [mode, data, kind, storage, filtered, count]
-        args += [3] if 'cold' in mode else [.35, 3]
+        args += [int(os.environ.get('VECTOR_PERF_COLD_TRIALS', '3'))] if 'cold' in mode else [.35, 3]
         binary = 'vector_system_search'
     if 'alloc' in mode:
         env['LD_PRELOAD'] = str(candidate / 'libvector_alloc_probe.so')
@@ -93,6 +95,7 @@ metadata = {'baseline': os.environ['BASELINE_SHA'], 'before': os.environ['BEFORE
             'candidate': os.environ['GITHUB_SHA'], 'order': ['reference', 'candidate', 'candidate', 'reference'],
             'allocation_scope': 'caller threads for warm read/search; entire process for cold I/O and writes',
             'cpu_scope': 'entire process', 'suite': os.environ.get('VECTOR_PERF_SUITE', 'affected'), 'fixtures': fixtures,
+            'cold_trials': int(os.environ.get('VECTOR_PERF_COLD_TRIALS', '3')),
             'avx2_scope': 'AVX512 distance dispatch flags masked before initialization; other hardware features remain native', 'cold_scope': 'new file with zero resident Linux page-cache pages before open'}
 for label, directory in [('main', main), ('before', before), ('candidate', candidate)]:
     metadata[label + '_sha256'] = {
@@ -104,11 +107,12 @@ kinds = ('flat', 'fp16', 'ivf', 'physical', 'raw16', 'cos32', 'ip32')
 cpu_flags = Path('/proc/cpuinfo').read_text().lower()
 arches = ('auto', 'avx2') if platform.machine() == 'x86_64' and 'avx512f' in cpu_flags else ('auto',)
 full_suite = metadata['suite'] == 'all'
+storages = ('bufferpool',) if metadata['suite'] == 'storage' else ('mmap', 'bufferpool')
 for arch in arches:
     prepare(arch, arch, 'fixture', kinds)
     for name, reference in [('main', main), ('before', before)]:
         for kind in kinds:
-            for storage in ('mmap', 'bufferpool'):
+            for storage in storages:
                 for threads in (1, 4):
                     for mode in ('warm', 'alloc', 'fetchwarm', 'fetchalloc'):
                         if not full_suite and (mode.startswith('fetch') != (kind == 'physical')):
@@ -122,13 +126,15 @@ for arch in arches:
                         if not full_suite and (mode.startswith('fetch') != (kind == 'physical')):
                             continue
                         compare(arch, name, reference, mode, kind, storage, count=batch)
+                        if metadata['suite'] == 'storage' and mode == 'cold' and batch == 1 and kind in ('flat', 'cos32', 'ip32'):
+                            compare(arch, name, reference, mode, kind, storage, count=batch, replica=1)
         if full_suite:
             for kind in ('flat', 'ivf'):
                 for storage in ('mmap', 'bufferpool'):
                     for mode in ('write', 'writealloc'):
                         compare(arch, name, reference, mode, kind, storage)
     if arch == 'auto' and len(arches) > 1:
-        for storage in ('mmap', 'bufferpool'):
+        for storage in storages:
             for count in (1, 4):
                 for mode in ('fetchwarm', 'fetchalloc'):
                     compare(arch, 'candidate-avx2', candidate, mode, 'physical', storage,
@@ -140,7 +146,7 @@ for arch in arches:
     data_name = f'{arch}-d256'
     prepare(arch, data_name, 'fixture256', ('raw16',))
     for name, reference in [('main', main), ('before', before)]:
-        for storage in ('mmap', 'bufferpool'):
+        for storage in storages:
             for count in (1, 4):
                 for mode in ('warm', 'alloc'):
                     compare(arch, name, reference, mode, 'raw16', storage, count=count, data_name=data_name)
