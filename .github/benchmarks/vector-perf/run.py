@@ -106,6 +106,26 @@ for label, directory in [('main', main), ('before', before), ('candidate', candi
 kinds = ('flat', 'fp16', 'ivf', 'physical', 'raw16', 'cos32', 'ip32')
 cpu_flags = Path('/proc/cpuinfo').read_text().lower()
 arches = ('auto', 'avx2') if platform.machine() == 'x86_64' and 'avx512f' in cpu_flags else ('auto',)
+if metadata['suite'] == 'dot':
+    if len(arches) != 2:
+        raise RuntimeError('The AVX-512 dot experiment requires a compatible native runner')
+    for arch in arches:
+        prepare(arch, arch, 'fixture', ('flat', 'cos32', 'ip32'))
+        for name, reference in [('main', main), ('before', before)]:
+            for kind in ('cos32', 'ip32'):
+                for count in (1, 4):
+                    for replica in range(2):
+                        compare(arch, name, reference, 'warm', kind, 'bufferpool',
+                                count=count, replica=replica)
+                    compare(arch, name, reference, 'alloc', kind, 'bufferpool', count=count)
+                for mode in ('warm', 'alloc'):
+                    compare(arch, name, reference, mode, kind, 'bufferpool', filtered=1)
+                for count in (1, 64):
+                    for replica in range(2):
+                        compare(arch, name, reference, 'cold', kind, 'bufferpool',
+                                count=count, replica=replica)
+                    compare(arch, name, reference, 'coldalloc', kind, 'bufferpool', count=count)
+    sys.exit(0)
 full_suite = metadata['suite'] == 'all'
 storages = ('bufferpool',) if metadata['suite'] == 'storage' else ('mmap', 'bufferpool')
 if metadata['suite'] == 'cold':
