@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 180
     env:
       BASELINE_SHA: 8d4996924bce78f8b072a353803c305101bcc807
-      BEFORE_SHA: 39f876236f64034da9b03a64621a94ef43da9c97
+      BEFORE_SHA: be34b2ce770b5c6c7fb192e5a3ad410a2612db99
       DECODE_REFERENCE_SHA: 0659259a7fae0f5d0fec5337e82a37b975db7a6a
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
@@ -29,7 +29,7 @@ jobs:
         run: |
           mkdir -p .apt-vector-perf
           sudo apt-get update
-          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives="$GITHUB_WORKSPACE/.apt-vector-perf" -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends build-essential cmake ninja-build ccache python3 git ca-certificates zstd libaio-dev liburing-dev libzstd-dev linux-perf
+          sudo DEBIAN_FRONTEND=noninteractive apt-get -o Dir::Cache::archives="$GITHUB_WORKSPACE/.apt-vector-perf" -o APT::Keep-Downloaded-Packages=true install -y --no-install-recommends build-essential cmake ninja-build ccache python3 git ca-certificates zstd libaio-dev liburing-dev libzstd-dev linux-perf strace
           perf --version
           mkdir -p results
           lscpu > results/cpu.txt
@@ -160,7 +160,8 @@ jobs:
           nice -n 10 cmake -S benchmark-harness -B build-candidate -G Ninja \
             -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE/candidate" -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
-          nice -n 10 cmake --build build-candidate --target vector_system_search vector_pool_workloads vector_alloc_probe turbo_avx2_distance_test turbo_fp16_quantizer_test --parallel 4
+          nice -n 10 cmake --build build-candidate --target vector_system_search vector_pool_workloads vector_alloc_probe turbo_avx2_distance_test turbo_fp16_quantizer_test flat_quantizer_distance_test vector_page_table_test --parallel 4
+          nice -n 10 ctest --test-dir build-candidate -R '^(flat_quantizer_distance_test|vector_page_table_test)$' --output-on-failure --no-tests=error
           mkdir -p bench-candidate/lib
           cp build-candidate/vector_system_search build-candidate/vector_pool_workloads build-candidate/libvector_alloc_probe.so \
             build-candidate/zvec/bin/turbo_avx2_distance_test build-candidate/zvec/bin/turbo_fp16_quantizer_test bench-candidate/
@@ -245,6 +246,16 @@ jobs:
           record_profile results/physical-fetch.perf \
             bench-candidate/vector_system_search fetchwarm "$GITHUB_WORKSPACE/results/auto" physical bufferpool 0 1 8 1 > results/profile-fetch.csv 2> results/profile-fetch.log
           "$perf_bin" report -i results/physical-fetch.perf --stdio > results/physical-fetch-profile.txt
+          for kind in flat cos32 ip32; do
+            record_profile "results/$kind-filtered.perf" \
+              bench-candidate/vector_system_search warm "$GITHUB_WORKSPACE/results/auto" "$kind" bufferpool 1 1 8 1 > "results/profile-$kind-filtered.csv" 2> "results/profile-$kind-filtered.log"
+            "$perf_bin" report -i "results/$kind-filtered.perf" --stdio > "results/$kind-filtered-profile.txt"
+          done
+          for version in main candidate; do
+            strace -f -c -e trace=pread64,preadv,io_setup,io_submit,io_getevents,io_uring_setup,io_uring_enter \
+              -o "results/cold-$version-syscalls.txt" \
+              "bench-$version/vector_system_search" cold "$GITHUB_WORKSPACE/results/auto" flat bufferpool 0 1 3 > "results/cold-$version-traced.csv" 2> "results/cold-$version-traced.log"
+          done
       - uses: actions/upload-artifact@v7
         if: always()
         with:

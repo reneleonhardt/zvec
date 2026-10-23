@@ -41,6 +41,10 @@ def main():
             filename = f"src/turbo/distance/{isa}/{path}.cc"
             source = subprocess.check_output(
                 ["git", "-C", str(root), "show", f"{reference}:{filename}"], text=True)
+            if (root / filename).read_bytes() != source.encode():
+                raise RuntimeError(
+                    f"{filename} must remain byte-identical to frozen main; "
+                    "sampled inputs cannot prove every NaN payload")
             namespace = f"namespace zvec::turbo::{isa} {{"
             if source.count(namespace) != 1:
                 raise RuntimeError(f"unexpected frozen namespace: {filename}")
