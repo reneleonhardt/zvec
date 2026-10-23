@@ -22,14 +22,14 @@ jobs:
       VECTOR_PERF_SUITE: cold-ip
       VECTOR_PERF_COLD_TRIALS: 7
     steps:
-      - name: Require a compatible native AVX-512 runner
+      - name: Require a compatible native AMD runner
         run: |
           set -euo pipefail
           if ! grep -q 'AuthenticAMD' /proc/cpuinfo; then
             echo "The cold-IP diagnosis requires an AMD host; stopping before installation or builds" >&2
             exit 1
           fi
-          for feature in avx2 fma f16c avx512f avx512dq avx512bw avx512vl; do
+          for feature in avx2 fma f16c; do
             if ! grep -qw "$feature" /proc/cpuinfo; then
               echo "Runner lacks $feature; stopping before dependency installation or compilation" >&2
               exit 1
