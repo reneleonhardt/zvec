@@ -15,6 +15,7 @@ assembly for both x86-64 and ARM targets, without linking project libraries:
 ```sh
 nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_compiler_check.py
 nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_register_check.py
+nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_allocator_check.py
 nice -n 10 python3 .github/benchmarks/vector-perf/proofs/compiler_check.py \
   --cache .local/compiler-proof-cache --output .local/compiler-proof-report.json
 ```
@@ -92,6 +93,52 @@ Verification artifacts reuse a separate dependency-checked sidecar cache, so
 the existing AST/IR cache stays warm. Tests deliberately corrupt FMA encodings,
 operand order, register assignments/views, copy slots, FP-state uses and stack
 addresses; one control mutates an actual compiler dump.
+
+## Earlier allocator transformations
+
+The same cached compile also dumps every invocation of LLVM's greedy allocator,
+before and after it runs. There can be several invocations per function.
+`allocator_check.py` pairs these dumps without relying on instruction addresses:
+LLVM can recycle addresses after deleting instructions.
+
+The frame audit requires unchanged CFG edges and existing frame objects. For
+every new spill slot it checks annotated byte ranges against the frame size,
+the encoded frame-index address against the memory annotation, and a full-width
+store on **every incoming path** before each reload. This includes reloads folded
+into arithmetic. A finite must-defined-byte dataflow analysis handles joins and
+loops; a store on only one predecessor is insufficient. Unexpected spill-address
+escapes fail closed. SMT obligations instantiated from observed spill widths
+prove arbitrary-bit packing/unpacking, distinct byte addresses, and the byte-store
+round-trip/noninterference induction step. They include all NaN payload bits.
+They prove transport of the stored value, not that an arbitrary earlier store
+contains the source program's intended value.
+
+The local value audit follows copies, same-range stores/reloads and constant
+recipes into ordered FP operation graphs. Overlapping writes invalidate cached
+stack values. It keeps arithmetic opaque and ordered, including FP-environment
+uses, so a matched graph requires no assumption about rounding or NaN payload
+selection. Repeated operand-free integer constants and immutable constant-pool
+loads can match their original recipes after rematerialization. New recipes
+without such a match fail the normal audit. FP operation duplication/removal and
+operation changes also fail. Fully modeled simple blocks reject changed input
+provenance, including a reload of the wrong stored vector.
+
+FMA encodings and multiplicands are never silently commuted. An observed encoding
+change or recognized multiplicand swap requires a separate NaN-priority proof;
+the normal audit rejects it. The non-strict Python API exists for diagnostic
+reports and negative controls; CI always uses the strict default. This is a
+conservative check rather than a vendor-independent theorem equating FMA forms.
+
+Coverage is explicit. A matched local graph is a block lemma under equal entry
+values, **not a whole-function allocator certificate**. New live-in register/stack
+values generate unproved entry contracts. Calls, undefined/conditional values,
+partial-register definitions and unresolved lane/address expressions remain
+conditional/unproved. Their counts and reasons appear in both the JSON report
+and CI log. Independent checks do not establish all cross-block value invariants,
+general rematerialization purity, register interference, or final frame layout.
+The compiler's structural checks and frozen-reference execution oracles remain
+necessary. Passing this audit must not be described as proving all allocator
+transformations for every input.
 
 `check.py --emit path.smt2` saves the exact solver input for independent inspection or
 execution with `z3 path.smt2`. Each ordinary query asks for a counterexample;
@@ -195,9 +242,9 @@ verified intermediate language. Source fingerprints remain required too.
 
 The IR/assembly checks are practical compiler regression checks, **not formal
 translation validation of every emitted instruction**. The register validator
-covers physical-register rewriting, not the preceding allocator's splitting,
-rematerialization, spilling or FMA commuting transformations. Those receive
-compiler structural checks, not independent semantic translation validation.
+covers physical-register rewriting. The earlier allocator now has independent
+frame checks and bounded local value checks as described above, plus compiler
+structural checks; it still lacks complete semantic translation validation.
 Earlier instruction selection, later pseudo expansion, horizontal-reduction
 lowering and CPU behavior remain outside this independent check. GCC does not
 have the LLVM dump comparison. Native bit/exception comparisons in the parent

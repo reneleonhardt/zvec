@@ -97,7 +97,7 @@ def dumps(text):
             if key in result:
                 raise ValueError("duplicate register-rewrite dump")
             result[key] = {}
-        elif line.startswith("# End machine code"):
+        elif phase and line.startswith("# End machine code"):
             ended.add((phase, name))
             name = block = None
         elif name:

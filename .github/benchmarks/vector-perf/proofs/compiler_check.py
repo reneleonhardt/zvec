@@ -15,6 +15,7 @@ import shutil
 import subprocess
 
 import check
+import allocator_check
 import register_check
 
 
@@ -363,7 +364,7 @@ def compile_one(root, cache, compiler, target, march, path, gnu=False):
                 "compiler": "GCC assembly", "recurrences": []}
     # Keep the existing AST/IR/assembly cache warm. Verification has its own
     # compiler-keyed sidecar and must produce exactly the unaudited assembly.
-    flags = register_check.VERIFY + register_check.DUMP
+    flags = register_check.VERIFY + register_check.DUMP + allocator_check.DUMP
     verified = directory / hashlib.sha256(json.dumps(flags).encode()).hexdigest()[:16]
     verified.mkdir(exist_ok=True)
     verified_hit = cache_hit(verified, identity, ("kernel.s", "registers.txt"))
@@ -378,6 +379,7 @@ def compile_one(root, cache, compiler, target, march, path, gnu=False):
     if (directory / "kernel.s").read_bytes() != (verified / "kernel.s").read_bytes():
         raise ValueError(f"verification changed emitted assembly: {path}")
     registers = register_check.audit((verified / "registers.txt").read_text())
+    allocator = allocator_check.audit((verified / "registers.txt").read_text())
     ast = (directory / "ast.json").read_text()
     trace = source_trace(ast)
     decode = decoder_trace(ast) if "/conversion/" in path else None
@@ -388,6 +390,7 @@ def compile_one(root, cache, compiler, target, march, path, gnu=False):
         raise ValueError(f"{path}: vector accumulator edges were not extracted")
     return {"path": path, "target": target, "march": march, "cache_hit": hit,
             "register_cache_hit": verified_hit, "register_rewrite": registers,
+            "allocator": allocator,
             "recurrences": trace, "decoder": decode,
             "source": check.fingerprint((root / path).read_text())}
 
@@ -437,8 +440,24 @@ def main():
             print(f"PASS {record['path']}: {len(record['recurrences'])} source recurrence edges; cache={record['cache_hit']}", flush=True)
     proofs = check.Proofs()
     source_obligations(proofs, results)
+    allocator_check.obligations(proofs, results)
     proofs.run()
     print(f"PASS {len(results)} cross-target translation units")
+    totals = {}
+    pending = {}
+    for record in results:
+        for name, value in record['allocator'].items():
+            if isinstance(value, int):
+                totals[name] = totals.get(name, 0) + value
+        for reason, count in record['allocator']['unresolved'].items():
+            pending[reason] = pending.get(reason, 0) + count
+    print(f"PASS allocator frame checks: {totals['new_slots']} new slots, "
+          f"{totals['spill_stores']} stores, {totals['reloads']} reloads")
+    print(f"Local FP graphs: {totals['exact_fp_blocks']} matched; "
+          f"{totals['conditional_fp_blocks']} conditional/unproved; "
+          f"{totals['entry_contracts']} unproved entry equalities")
+    for reason, count in sorted(pending.items()):
+        print(f"UNPROVED local coverage ({count}): {reason}")
     if args.gnu_cxx:
         def gnu_task(path):
             family = path.split("/")[3]
