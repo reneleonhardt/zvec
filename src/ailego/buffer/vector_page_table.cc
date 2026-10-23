@@ -2834,13 +2834,48 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
 
     std::array<bool, kBlockingAioBatchSize> read_ok{};
 #if defined(__linux__)
+    bool filled = false;
+    bool ordered = !writable_ && allocated > 3 &&
+                   load_pages[allocated - 1] < file_size_ / kVectorPageSize;
+    for (size_t i = 1; ordered && i < allocated; ++i)
+      ordered = load_pages[i] > load_pages[i - 1];
+    const size_t span = ordered ? load_pages[allocated - 1] - load_pages[0] + 1
+                                : 0;
+    static constexpr size_t kMaxGaps = 8;
+    if (span > allocated && span - allocated <= kMaxGaps) {
+      struct GapScratch {
+        char *data{nullptr};
+        ~GapScratch() { ailego_free(data); }
+      };
+      static thread_local GapScratch scratch;
+      if (!scratch.data)
+        scratch.data = static_cast<char *>(ailego_aligned_malloc(
+            kMaxGaps * kVectorPageSize, kVectorPageSize));
+      if (scratch.data) {
+        // Read across small resident holes without writing into their frames.
+        std::array<iovec, kBlockingAioBatchSize + kMaxGaps> vectors;
+        size_t next = 0, gaps = 0;
+        for (size_t i = 0; i < span; ++i) {
+          const bool missing =
+              next < allocated && load_pages[next] == load_pages[0] + i;
+          char *destination = missing ? buffers[next++]
+                                      : scratch.data + gaps++ * kVectorPageSize;
+          vectors[i] = {destination, kVectorPageSize};
+        }
+        ssize_t got;
+        do {
+          got = ::preadv(fd_, vectors.data(), static_cast<int>(span),
+                         load_pages[0] * kVectorPageSize);
+        } while (got < 0 && errno == EINTR);
+        if (got == static_cast<ssize_t>(span * kVectorPageSize))
+          std::fill_n(read_ok.begin(), allocated, true);
+        filled = true;
+      }
+    }
     // Dense immutable scans need one read, not one AIO request per page.
     // Full-page iovecs satisfy O_DIRECT alignment.
-    bool coalesce = !writable_ && allocated > 3 &&
-                    load_pages[allocated - 1] < file_size_ / kVectorPageSize;
-    for (size_t i = 1; coalesce && i < allocated; ++i)
-      coalesce = load_pages[i] == load_pages[i - 1] + 1;
-    if (coalesce) {
+    const bool coalesce = ordered && span == allocated;
+    if (!filled && coalesce) {
 #endif
     // Coalesce consecutive claims directly into their cache frames.
     for (size_t begin = 0; begin < allocated;) {
@@ -2891,7 +2926,7 @@ bool VecBufferPool::load_pages_aio(const block_id_t *page_ids, size_t count,
       begin = end;
     }
 #if defined(__linux__)
-    } else {
+    } else if (!filled) {
     bool use_io_uring = io_backend_type_ == IOBackendType::kIoUring &&
                         tl_blocking_io_uring.ensure();
     if (!use_io_uring && !tl_blocking_aio.ensure()) {

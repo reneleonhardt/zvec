@@ -1913,6 +1913,8 @@ TEST_F(BufferPoolTest, DenseClaimedReadsKeepTailAndIndependentPins) {
   ASSERT_EQ(0, pool.init());
   if (!pool.aio_enabled()) GTEST_SKIP() << "no asynchronous backend";
   auto handle = pool.get_handle();
+  const block_id_t resident_ids[] = {7, 23, 55, 89};
+  for (auto id : resident_ids) ASSERT_NE(nullptr, pool.acquire_buffer(id));
   std::array<block_id_t, count> ids;
   std::array<char *, count> pages{};
   for (size_t i = 0; i < count; ++i) ids[i] = i;
@@ -1925,6 +1927,10 @@ TEST_F(BufferPoolTest, DenseClaimedReadsKeepTailAndIndependentPins) {
   EXPECT_EQ(count, pool.stats().miss);
   EXPECT_LE(pool.stats().aio_pages_submitted, 1U);
   handle.release_pages(ids.data(), count);
+  for (auto id : resident_ids) {
+    EXPECT_FALSE(pool.page_table_.is_released(id));
+    pool.page_table_.release_block(id);
+  }
   for (auto id : ids) EXPECT_TRUE(pool.page_table_.is_released(id));
 }
 
@@ -1934,11 +1940,20 @@ TEST_F(BufferPoolTest, FailedDenseReadReleasesEveryClaim) {
   VecBufferPool pool(file, /*writable=*/false);
   ASSERT_EQ(0, pool.init());
   if (!pool.aio_enabled()) GTEST_SKIP() << "no asynchronous backend";
+  for (auto id : {1, 3}) {
+    ASSERT_NE(nullptr, pool.acquire_buffer(id));
+    pool.page_table_.release_block(id);
+  }
   ASSERT_EQ(0, ::truncate(file.c_str(), 1));
   const block_id_t ids[] = {0, 1, 2, 3, 4, 5, 6, 7};
   char *pages[8]{};
   EXPECT_FALSE(pool.get_handle().acquire_pages(ids, 8, pages));
   for (auto id : ids) {
+    if (id == 1 || id == 3) {
+      EXPECT_TRUE(pool.is_page_resident(id));
+      EXPECT_TRUE(pool.page_table_.is_released(id));
+      continue;
+    }
     EXPECT_FALSE(pool.page_table_.has_residency_activity(id));
     EXPECT_EQ(VectorPageTable::LoadClaimResult::kClaimed,
               pool.page_table_.try_claim_block_load(id));
@@ -1989,6 +2004,10 @@ TEST_F(BufferPoolTest, ConcurrentBatchLoadsPopulateEachPageOnce) {
   VecBufferPool pool(file, /*writable=*/false);
   ASSERT_EQ(pool.init(), 0);
   auto handle = pool.get_handle();
+  for (auto id : {7, 23, 55, 89}) {
+    ASSERT_NE(nullptr, pool.acquire_buffer(id));
+    pool.page_table_.release_block(id);
+  }
   std::array<block_id_t, kPageCount> page_ids{};
   for (size_t i = 0; i < kPageCount; ++i) {
     page_ids[i] = static_cast<block_id_t>(i);
