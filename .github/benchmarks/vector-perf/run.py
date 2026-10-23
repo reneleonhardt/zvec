@@ -124,6 +124,8 @@ if metadata['suite'] == 'cold-ip':
             for kind in ('flat', 'cos32', 'fp16', 'raw16', 'physical'):
                 for mode in ('cold', 'coldalloc'):
                     compare(arch, name, reference, mode, kind, 'bufferpool')
+        for replica in range(2):
+            compare(arch, 'self', candidate, 'cold', 'ip32', 'bufferpool', replica=replica)
     sys.exit(0)
 if metadata['suite'] == 'dot':
     if len(arches) != 2:
