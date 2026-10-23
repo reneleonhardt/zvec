@@ -150,7 +150,7 @@ TEST(FlatQuantizerDistance, FilteredStreamerKeepsPointDispatch) {
     EXPECT_EQ(0, pool.init(capacity));
   });
   // Whole blocks exceed one page on every platform; rows also cross pages.
-  const size_t dim = ailego::kVectorPageSize / (32 * sizeof(float)) + 65;
+  const size_t dim = 3 * ailego::kVectorPageSize / (4 * sizeof(float));
   IndexMeta meta(IndexMeta::DT_FP32, dim);
   meta.set_metric("SquaredEuclidean", 0, ailego::Params());
   auto quantizer = std::make_shared<DistinctPointQuantizer>();
@@ -187,7 +187,7 @@ TEST(FlatQuantizerDistance, FilteredStreamerKeepsPointDispatch) {
                                    &map, sizeof(map)));
       }
       IndexFilter filter;
-      if (!deleted) filter.set([](uint64_t id) { return id % 2 == 0; });
+      if (!deleted) filter.set([](uint64_t id) { return id % 4 != 1; });
       for (bool read_only : {false, true}) {
         if (read_only) {
           ASSERT_EQ(0, entity.flush(0));
@@ -206,12 +206,12 @@ TEST(FlatQuantizerDistance, FilteredStreamerKeepsPointDispatch) {
           ASSERT_EQ(0, entity.search(row.data(), filter, &scanned, &heap,
                                      &context_stats, &scratch));
           EXPECT_EQ(64U, scanned);
-          EXPECT_EQ(deleted ? 62U : 32U, quantizer->point_calls);
-          EXPECT_EQ(deleted ? 2U : 32U, context_stats.filtered_count());
+          EXPECT_EQ(deleted ? 62U : 16U, quantizer->point_calls);
+          EXPECT_EQ(deleted ? 2U : 48U, context_stats.filtered_count());
           heap.sort();
           ASSERT_EQ(4U, heap.size());
           for (size_t i = 0; i < heap.size(); ++i) {
-            const uint64_t key = deleted ? i + 1 : i * 2 + 1;
+            const uint64_t key = deleted ? i + 1 : i * 4 + 1;
             const float expected = float(key) + .25f;
             const float actual = heap[i].score();
             EXPECT_EQ(key, heap[i].key());
@@ -221,6 +221,10 @@ TEST(FlatQuantizerDistance, FilteredStreamerKeepsPointDispatch) {
             EXPECT_FALSE(scratch.vector_page_ids.empty());
             if (repeat == 1) {
               EXPECT_TRUE(scratch.vector_ptrs.empty());
+              if (!deleted) {
+                EXPECT_LT(scratch.vector_page_ids.size(),
+                          scratch.vector_pages.size());
+              }
               EXPECT_LE(scratch.vector_buffer.size() *
                             sizeof(scratch.vector_buffer[0]),
                         ailego_align(meta.element_size(), AILEGO_CACHE_LINE_SIZE));

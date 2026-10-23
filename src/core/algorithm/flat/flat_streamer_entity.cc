@@ -541,13 +541,29 @@ int FlatStreamerEntity::search_borrowed_block(
   if (offset > segment->data_size() || size > segment->data_size() - offset)
     return IndexError_ReadData;
   const size_t absolute = segment->data_offset() + offset;
+  // Match the owned path: filtered rows and singleton blocks use point kernels.
+  // Batch reductions can round differently even for finite inputs.
+  const bool point_distance = header->vector_count == 1 || filter.is_valid() ||
+                              deletion_map->is_dirty();
   auto &page_ids = scratch->vector_page_ids;
   auto &pages = scratch->vector_pages;
   const size_t first_page = absolute / ailego::kVectorPageSize;
   const size_t last_page = (absolute + size - 1) / ailego::kVectorPageSize;
-  page_ids.resize(last_page - first_page + 1);
-  pages.resize(page_ids.size());
-  for (size_t i = 0; i < page_ids.size(); ++i) page_ids[i] = first_page + i;
+  page_ids.clear();
+  pages.resize(last_page - first_page + 1);
+  if (point_distance) {
+    page_ids.reserve(pages.size());
+    for (size_t k = 0; k < header->vector_count; ++k) {
+      if (!keeps.test(k)) continue;
+      const size_t position = absolute + k * stride;
+      const size_t end = (position + stride - 1) / ailego::kVectorPageSize;
+      for (size_t page = position / ailego::kVectorPageSize; page <= end; ++page)
+        if (page_ids.empty() || page_ids.back() != page) page_ids.push_back(page);
+    }
+  } else {
+    page_ids.resize(pages.size());
+    for (size_t i = 0; i < page_ids.size(); ++i) page_ids[i] = first_page + i;
+  }
   bool resident = false;
   // Pins cover only this block's distance calculation, including exceptions.
   auto release = ailego::ScopeGuard::Make([&]() {
@@ -580,11 +596,10 @@ int FlatStreamerEntity::search_borrowed_block(
 #endif
   auto &pointers = scratch->vector_ptrs;
   pointers.clear();
-  // Match the owned path: filtered rows and singleton blocks use point kernels.
-  // Batch reductions can round differently even for finite inputs.
-  const bool point_distance = header->vector_count == 1 || filter.is_valid() ||
-                              deletion_map->is_dirty();
   if (resident && point_distance) {
+    // Expand compact pins backwards without overwriting an unread pointer.
+    for (size_t i = page_ids.size(); i-- > 0;)
+      pages[page_ids[i] - first_page] = pages[i];
     auto &buffer = scratch->vector_buffer;
     const size_t lines = ailego_align(stride, AILEGO_CACHE_LINE_SIZE) /
                          sizeof(buffer[0]);
