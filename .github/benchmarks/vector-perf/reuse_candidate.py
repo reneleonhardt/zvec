@@ -8,6 +8,8 @@ ALLOWED = {
     '.github/benchmarks/vector-perf/reuse_candidate.py',
     '.github/benchmarks/vector-perf/test_reuse_candidate.py',
     '.github/benchmarks/vector-perf/fenv_check.py',
+    '.github/benchmarks/vector-perf/run.py',
+    '.github/benchmarks/vector-perf/warm_profile.py',
 }
 
 

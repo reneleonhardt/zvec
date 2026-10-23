@@ -7,6 +7,7 @@ import os
 import platform
 import subprocess
 import sys
+import time
 
 main, before, candidate, output = map(lambda s: Path(s).resolve(), sys.argv[1:])
 output.mkdir(parents=True, exist_ok=True)
@@ -20,8 +21,16 @@ def invoke(exe, args, prefix, env):
     command = [str(exe), *map(str, args)]
     if args[0] in ('prepare', 'fetchoracle', 'fetchcheck', 'oracle', 'check'):
         command = ['nice', '-n', '10', *command]
+    def host_state():
+        path = Path('/sys/fs/cgroup/cpu.stat')
+        return {'monotonic_ns': time.monotonic_ns(), 'load': os.getloadavg(),
+                'cgroup_cpu': path.read_text() if path.exists() else None}
+    diagnostic = {'before': host_state()} if env.get('VECTOR_PERF_SUITE') == 'warm-contention' else None
     with prefix.with_suffix('.csv').open('w') as out, prefix.with_suffix('.log').open('w') as err:
         subprocess.run(command, env=env, stdout=out, stderr=err, check=True)
+    if diagnostic is not None:
+        diagnostic['after'] = host_state()
+        prefix.with_suffix('.json').write_text(json.dumps(diagnostic, indent=2) + '\n')
     return list(csv.DictReader(prefix.with_suffix('.csv').open()))
 
 
@@ -38,7 +47,7 @@ def compare(arch, reference_name, reference, mode, kind, storage, filtered=0, co
         binary = 'vector_pool_workloads'
     else:
         args = [mode, data, kind, storage, filtered, count]
-        args += [int(os.environ.get('VECTOR_PERF_COLD_TRIALS', '3'))] if 'cold' in mode else [.35, 3]
+        args += [int(os.environ.get('VECTOR_PERF_COLD_TRIALS', '3'))] if 'cold' in mode else [float(os.environ.get('VECTOR_PERF_WARM_SECONDS', '.35')), 3]
         binary = 'vector_system_search'
     if 'alloc' in mode:
         env['LD_PRELOAD'] = str(candidate / 'libvector_alloc_probe.so')
@@ -110,6 +119,20 @@ for label, directory in [('main', main), ('before', before), ('candidate', candi
 kinds = ('flat', 'fp16', 'ivf', 'physical', 'raw16', 'cos32', 'ip32')
 cpu_flags = Path('/proc/cpuinfo').read_text().lower()
 arches = ('auto', 'avx2') if platform.machine() == 'x86_64' and 'avx512f' in cpu_flags else ('auto',)
+if metadata['suite'] == 'warm-contention':
+    for arch in arches:
+        prepare(arch, arch, 'fixture', ('ip32',))
+        for count in (1, 4):
+            compare(arch, 'main', main, 'warm', 'ip32', 'bufferpool', count=count)
+            for name, reference in [('main', main), ('before', before)]:
+                compare(arch, name, reference, 'alloc', 'ip32', 'bufferpool', count=count)
+        for replica in range(3):
+            for count in (1, 4):
+                compare(arch, 'before', before, 'warm', 'ip32', 'bufferpool', count=count, replica=replica)
+            compare(arch, 'self', candidate, 'warm', 'ip32', 'bufferpool', count=4, replica=replica)
+            if replica == 1:
+                compare(arch, 'before-self', before, 'warm', 'ip32', 'bufferpool', count=4)
+    sys.exit(0)
 if metadata['suite'] == 'cold-ip':
     for arch in arches:
         prepare(arch, arch, 'fixture', ('ip32', 'flat', 'cos32', 'fp16', 'raw16', 'physical'))

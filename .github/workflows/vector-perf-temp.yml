@@ -15,12 +15,13 @@ jobs:
     env:
       BASELINE_SHA: 8d4996924bce78f8b072a353803c305101bcc807
       BEFORE_SHA: 00cffd5dcdebe3074a2e149bfec2b50843de5484
-      CACHED_CANDIDATE_SHA: c7995da32e6d004398b541a26d7d4078378d8f3d
+      CACHED_CANDIDATE_SHA: 9ecd1ce6bf5068988e91a4ccc32bf9a3097f0770
       DECODE_REFERENCE_SHA: 0659259a7fae0f5d0fec5337e82a37b975db7a6a
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
       CCACHE_MAXSIZE: 3G
-      VECTOR_PERF_SUITE: cold-ip
+      VECTOR_PERF_SUITE: warm-contention
+      VECTOR_PERF_WARM_SECONDS: 1
       VECTOR_PERF_COLD_TRIALS: 7
     steps:
       - name: Require a compatible native AMD runner
@@ -257,7 +258,7 @@ jobs:
           set -euo pipefail
           python3 benchmark-harness/run.py bench-main bench-before bench-candidate results | tee results/paired.log
       - name: Attribute cold-IP open and search waits
-        if: success()
+        if: success() && env.VECTOR_PERF_SUITE == 'cold-ip'
         run: |
           set -euo pipefail
           perf_bin=$(command -v perf)
@@ -277,6 +278,12 @@ jobs:
               "bench-$version/vector_system_search" cold "$GITHUB_WORKSPACE/results/auto" ip32 bufferpool 0 64 5 > "results/profile-$version-ip32-cold.csv" 2> "results/profile-$version-ip32-cold.log"
             "$perf_bin" report -i "results/$version-ip32-cold.perf" --stdio > "results/$version-ip32-cold-profile.txt"
           done
+      - name: Profile warm concurrency separately from paired timing
+        if: success() && env.VECTOR_PERF_SUITE == 'warm-contention'
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.perf_event_paranoid=1
+          python3 benchmark-harness/warm_profile.py bench-before bench-candidate results
       - uses: actions/upload-artifact@v7
         if: always()
         with:
