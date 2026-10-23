@@ -96,16 +96,32 @@ metadata = {'baseline': os.environ['BASELINE_SHA'], 'before': os.environ['BEFORE
             'allocation_scope': 'caller threads for warm read/search; entire process for cold I/O and writes',
             'cpu_scope': 'entire process', 'suite': os.environ.get('VECTOR_PERF_SUITE', 'affected'), 'fixtures': fixtures,
             'cold_trials': int(os.environ.get('VECTOR_PERF_COLD_TRIALS', '3')),
+            'cold_total_scope': 'open plus search; close/destruction excluded; traced separately',
             'avx2_scope': 'AVX512 distance dispatch flags masked before initialization; other hardware features remain native', 'cold_scope': 'new pathname and index/pool on an immutable inode; zero resident Linux page-cache pages before open, without payload-copy writeback'}
 for label, directory in [('main', main), ('before', before), ('candidate', candidate)]:
     metadata[label + '_sha256'] = {
         name: hashlib.sha256((directory / name).read_bytes()).hexdigest()
         for name in ('vector_system_search', 'vector_pool_workloads', 'libvector_alloc_probe.so')
     }
+    provenance = directory / 'binary-source-sha.txt'
+    if provenance.is_file():
+        metadata[label + '_binary_source'] = provenance.read_text().strip()
 (output / 'manifest.json').write_text(json.dumps(metadata, indent=2) + '\n')
 kinds = ('flat', 'fp16', 'ivf', 'physical', 'raw16', 'cos32', 'ip32')
 cpu_flags = Path('/proc/cpuinfo').read_text().lower()
 arches = ('auto', 'avx2') if platform.machine() == 'x86_64' and 'avx512f' in cpu_flags else ('auto',)
+if metadata['suite'] == 'cold-ip':
+    for arch in arches:
+        prepare(arch, arch, 'fixture', ('ip32',))
+        for name, reference in [('main', main), ('before', before)]:
+            for count in (1, 4):
+                compare(arch, name, reference, 'warm', 'ip32', 'bufferpool', count=count)
+                compare(arch, name, reference, 'alloc', 'ip32', 'bufferpool', count=count)
+            for count in (1, 64):
+                for replica in range(2):
+                    compare(arch, name, reference, 'cold', 'ip32', 'bufferpool', count=count, replica=replica)
+                compare(arch, name, reference, 'coldalloc', 'ip32', 'bufferpool', count=count)
+    sys.exit(0)
 if metadata['suite'] == 'dot':
     if len(arches) != 2:
         raise RuntimeError('The AVX-512 dot experiment requires a compatible native runner')

@@ -14,17 +14,21 @@ jobs:
     timeout-minutes: 180
     env:
       BASELINE_SHA: 8d4996924bce78f8b072a353803c305101bcc807
-      BEFORE_SHA: 37609cf744b9cf3b8bcc567a6200b83c31377d14
+      BEFORE_SHA: 563c808de36e717be5e12a85b163129f698697ff
       DECODE_REFERENCE_SHA: 0659259a7fae0f5d0fec5337e82a37b975db7a6a
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
       CCACHE_MAXSIZE: 3G
-      VECTOR_PERF_SUITE: dot
-      VECTOR_PERF_COLD_TRIALS: 3
+      VECTOR_PERF_SUITE: cold-ip
+      VECTOR_PERF_COLD_TRIALS: 7
     steps:
       - name: Require a compatible native AVX-512 runner
         run: |
           set -euo pipefail
+          if ! grep -q 'AuthenticAMD' /proc/cpuinfo; then
+            echo "The cold-IP diagnosis requires an AMD host; stopping before installation or builds" >&2
+            exit 1
+          fi
           for feature in avx2 fma f16c avx512f avx512dq avx512bw avx512vl; do
             if ! grep -qw "$feature" /proc/cpuinfo; then
               echo "Runner lacks $feature; stopping before dependency installation or compilation" >&2
@@ -168,6 +172,18 @@ jobs:
             echo "Reusing candidate executables and original-symbol proof"
             exit 0
           fi
+          if [[ -x bench-before/main-exact-bits && -x bench-before/split-exact-bits ]] &&
+             git -C candidate diff --quiet "$BEFORE_SHA" "$GITHUB_SHA" -- . \
+               ':!.github/benchmarks/vector-perf/run.py' \
+               ':!.github/benchmarks/vector-perf/cold_profile.py' \
+               ':!.github/benchmarks/vector-perf/test_cold_profile.py' \
+               ':!.github/workflows/vector-perf-temp.yml'; then
+            cp -a bench-before bench-candidate
+            echo "$BEFORE_SHA" > bench-candidate/binary-source-sha.txt
+            echo "$GITHUB_SHA" > bench-candidate/source-sha.txt
+            echo "Reusing identical production and proof binaries for a diagnostic-only change"
+            exit 0
+          fi
           nice -n 10 cmake -S benchmark-harness -B build-candidate -G Ninja \
             -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE/candidate" -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
@@ -229,7 +245,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 benchmark-harness/run.py bench-main bench-before bench-candidate results | tee results/paired.log
-      - name: Profile unfiltered dot search and cold reads
+      - name: Attribute cold-IP open and search waits
         if: success()
         run: |
           set -euo pipefail
@@ -243,17 +259,11 @@ jobs:
             "$perf_bin" record -e cycles:u -g --call-graph dwarf -o "$profile_output" -- "$@" ||
               "$perf_bin" record -e cpu-clock:u -g --call-graph dwarf -o "$profile_output" -- "$@"
           }
+          python3 benchmark-harness/cold_profile.py bench-main bench-before bench-candidate results
           for version in main before candidate; do
-            for kind in cos32 ip32; do
-              record_profile "results/$version-$kind-unfiltered.perf" \
-                "bench-$version/vector_system_search" warm "$GITHUB_WORKSPACE/results/auto" "$kind" bufferpool 0 1 8 1 > "results/profile-$version-$kind-unfiltered.csv" 2> "results/profile-$version-$kind-unfiltered.log"
-              "$perf_bin" report -i "results/$version-$kind-unfiltered.perf" --stdio > "results/$version-$kind-unfiltered-profile.txt"
-            done
-          done
-          for version in main candidate; do
-            strace -f -c -e trace=pread64,preadv,io_setup,io_submit,io_getevents,io_uring_setup,io_uring_enter \
-              -o "results/cold-$version-syscalls.txt" \
-              "bench-$version/vector_system_search" cold "$GITHUB_WORKSPACE/results/auto" flat bufferpool 0 1 3 > "results/cold-$version-traced.csv" 2> "results/cold-$version-traced.log"
+            record_profile "results/$version-ip32-cold.perf" \
+              "bench-$version/vector_system_search" cold "$GITHUB_WORKSPACE/results/auto" ip32 bufferpool 0 64 5 > "results/profile-$version-ip32-cold.csv" 2> "results/profile-$version-ip32-cold.log"
+            "$perf_bin" report -i "results/$version-ip32-cold.perf" --stdio > "results/$version-ip32-cold-profile.txt"
           done
       - uses: actions/upload-artifact@v7
         if: always()
@@ -265,4 +275,5 @@ jobs:
             results/*.log
             results/*.txt
             results/*.perf
+            results/*.trace
           retention-days: 14
