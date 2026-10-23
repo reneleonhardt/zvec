@@ -18,14 +18,43 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 2
+      - uses: actions/cache/restore@v6
+        id: proof-tools
+        with:
+          path: .apt-vector-proof/*.deb
+          key: vector-proof-apt-2604-v1-${{ github.run_id }}
+          restore-keys: vector-proof-apt-2604-v1-
       - name: Check arithmetic models without building project libraries
         run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends z3 clang g++-aarch64-linux-gnu
+          set -euo pipefail
+          missing=()
+          command -v z3 >/dev/null || missing+=(z3)
+          command -v clang++ >/dev/null || missing+=(clang)
+          command -v g++ >/dev/null || missing+=(g++)
+          command -v aarch64-linux-gnu-g++ >/dev/null || missing+=(g++-aarch64-linux-gnu)
+          if ((${#missing[@]})); then
+            mkdir -p .apt-vector-proof
+            for sources in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+              if [[ -f "$sources" ]]; then
+                sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$sources"
+              fi
+            done
+            sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update
+            sudo DEBIAN_FRONTEND=noninteractive apt-get \
+              -o Dir::Cache::archives="$GITHUB_WORKSPACE/.apt-vector-proof" \
+              -o APT::Keep-Downloaded-Packages=true \
+              -o Acquire::Retries=1 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+              install -y --no-install-recommends "${missing[@]}"
+          fi
           z3 --version
           nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_check.py
           nice -n 10 python3 .github/benchmarks/vector-perf/proofs/check.py
           nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_compiler_check.py
+      - uses: actions/cache/save@v6
+        if: always() && steps.proof-tools.outputs.cache-hit != 'true'
+        with:
+          path: .apt-vector-proof/*.deb
+          key: vector-proof-apt-2604-v1-${{ github.run_id }}
       - uses: actions/cache@v6
         with:
           path: .local/compiler-proof-cache
