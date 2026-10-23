@@ -549,21 +549,9 @@ int FlatStreamerEntity::search_borrowed_block(
   auto &pages = scratch->vector_pages;
   const size_t first_page = absolute / ailego::kVectorPageSize;
   const size_t last_page = (absolute + size - 1) / ailego::kVectorPageSize;
-  page_ids.clear();
-  pages.resize(last_page - first_page + 1);
-  if (point_distance) {
-    page_ids.reserve(pages.size());
-    for (size_t k = 0; k < header->vector_count; ++k) {
-      if (!keeps.test(k)) continue;
-      const size_t position = absolute + k * stride;
-      const size_t end = (position + stride - 1) / ailego::kVectorPageSize;
-      for (size_t page = position / ailego::kVectorPageSize; page <= end; ++page)
-        if (page_ids.empty() || page_ids.back() != page) page_ids.push_back(page);
-    }
-  } else {
-    page_ids.resize(pages.size());
-    for (size_t i = 0; i < page_ids.size(); ++i) page_ids[i] = first_page + i;
-  }
+  page_ids.resize(last_page - first_page + 1);
+  pages.resize(page_ids.size());
+  for (size_t i = 0; i < page_ids.size(); ++i) page_ids[i] = first_page + i;
   bool resident = false;
   // Pins cover only this block's distance calculation, including exceptions.
   auto release = ailego::ScopeGuard::Make([&]() {
@@ -573,6 +561,19 @@ int FlatStreamerEntity::search_borrowed_block(
   });
   resident = borrowed_pool_->try_acquire_resident_pages(
       page_ids.data(), page_ids.size(), pages.data());
+  if (!resident && point_distance) {
+    // Rejected-only pages need not be resident for a filtered query.
+    page_ids.clear();
+    for (size_t k = 0; k < header->vector_count; ++k) {
+      if (!keeps.test(k)) continue;
+      const size_t position = absolute + k * stride;
+      const size_t end = (position + stride - 1) / ailego::kVectorPageSize;
+      for (size_t page = position / ailego::kVectorPageSize; page <= end; ++page)
+        if (page_ids.empty() || page_ids.back() != page) page_ids.push_back(page);
+    }
+    resident = borrowed_pool_->try_acquire_resident_pages(
+        page_ids.data(), page_ids.size(), pages.data());
+  }
 #if defined(__APPLE__)
   if (!resident && read_only_ && !filter.is_valid() &&
       index_meta_.data_type() == IndexMeta::DT_FP32 &&
@@ -597,9 +598,11 @@ int FlatStreamerEntity::search_borrowed_block(
   auto &pointers = scratch->vector_ptrs;
   pointers.clear();
   if (resident && point_distance) {
-    // Expand compact pins backwards without overwriting an unread pointer.
-    for (size_t i = page_ids.size(); i-- > 0;)
-      pages[page_ids[i] - first_page] = pages[i];
+    if (page_ids.size() != pages.size()) {
+      // Expand compact pins backwards without overwriting an unread pointer.
+      for (size_t i = page_ids.size(); i-- > 0;)
+        pages[page_ids[i] - first_page] = pages[i];
+    }
     auto &buffer = scratch->vector_buffer;
     const size_t lines = ailego_align(stride, AILEGO_CACHE_LINE_SIZE) /
                          sizeof(buffer[0]);
