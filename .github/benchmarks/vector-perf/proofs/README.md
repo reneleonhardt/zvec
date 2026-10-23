@@ -1,0 +1,118 @@
+# Arithmetic proof checks
+
+Run from the repository root, with Python 3 and Z3 on `PATH`:
+
+```sh
+nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_check.py
+nice -n 10 python3 .github/benchmarks/vector-perf/proofs/check.py
+```
+
+`--emit path.smt2` saves the exact solver input for independent inspection or
+execution with `z3 path.smt2`. Each ordinary query asks for a counterexample;
+`unsat` is the required result. Deliberately broken negative controls require
+`sat`. Solver errors, missing answers, `unknown`, and timeouts fail the check.
+These tools are never linked into the library and add no runtime comparisons,
+allocations, or CPU-feature dependencies.
+
+## Classifiers and decoder
+
+* Every current integer FP32 NaN classifier in the distance sources is extracted
+  and checked against exponent-all-ones plus nonzero fraction, for arbitrary
+  32-bit inputs. This includes both signs and every quiet/signaling payload.
+* Both x86 cosine decoders exclude all special FP16 input encodings before
+  conversion. The symbolic exponent check covers every 16-bit encoding.
+  The checker validates the scalar widening tables and symbolically proves
+  widening every finite half, including subnormals and signed zero, has the
+  same bits as IEEE FP16 -> FP32 conversion.
+* For either sign and every FP32 result whose magnitude is in
+  `0x38800000..0x477fefff`, the scalar helper's table indices are in its normal
+  half domain. The checker reads and validates every reachable table entry.
+  The symbolic proof then compares its ties-away packing/unpacking with the
+  SIMD add-4096/clear-low-13-bits transformation.
+* The rounded result is a finite normal half, represented exactly as FP32.
+  An IEEE floating-point query additionally proves FP32 -> FP16 -> FP32 is
+  bit-identical for **every rounding mode**. Thus these conversions need no
+  rounding, underflow, or overflow and add no conversion exception flags under
+  the documented x86 conversion semantics. The preceding FP32 multiplication
+  retains its original operation; its own exceptions are not suppressed.
+
+The upper endpoint matters: extending it through `0x477ff000` allows conversion
+to half infinity and can add a hardware overflow flag that the scalar integer
+packer does not raise. The negative controls also reject treating infinity as
+NaN and changing the rounding increment.
+
+## Accumulation invariants
+
+`accumulation.py` instantiates the same inductive argument for the following
+ordered graph shapes. Width is the arithmetic lane width, not the input width.
+
+| Graph | Lane bits x lanes | Chains | Updates/chain/block |
+| --- | --- | --- | --- |
+| Scalar FP32 / widened FP16 | 32 x 1 | 1 | 1 |
+| SSE2 FP32 / widened FP16 | 32 x 4 | 1 | 1 |
+| AVX2 FP32 ordered mul/add or FMA | 32 x 8 | 1 | 1 |
+| AVX2 F16C FP16 FMA | 32 x 8 | 1 | 2 |
+| AVX-512 FP32 ordered mul/add or FMA | 32 x 16 | 1 | 1 |
+| AVX-512 F16C FP16 FMA | 32 x 16 | 1 | 2 |
+| AVX-512 VNNI namespace raw FP16 L2 | 32 x 16 | 2 | 1 |
+| Native AVX-512 FP16 | 16 x 32 | 2 | 1 |
+| NEON FP32 / widened FP16 | 32 x 4 | 2 | 1 |
+| NEON FP16 widened IP/L2 | 32 x 4 | 4 | 1 |
+| NEON FP16 native cosine | 16 x 8 | 4 | 1 |
+
+The invariant is: **after any number of complete blocks, every row/chain/lane
+has the same raw bits, and the final accumulated sticky flags are equal**, when
+the optimization only interleaves independent rows while keeping their ordered
+instruction graphs unchanged.
+
+An instruction sequence is modeled as deterministic functions returning raw
+bits and raised flag bits, parameterized by its FP environment. No real-number
+identities or assumptions about NaN payload selection are used. The solver
+checks one arbitrary block from arbitrary incoming accumulator bits, allowing
+row order and chain order to interleave, and checks address injectivity for
+arbitrary row/chain/lane indices. Identical +0 initialization establishes the
+base case; the block lemma extends it by induction. Adjacent independent-row
+swaps extend the two-row lemma to any finite batch size. Ordered reduction and
+tail graphs preserve equality by congruence. Repeated shared-query conversion
+raises the same final sticky flags because bitwise OR is idempotent.
+
+The instruction functions are opaque on purpose. The theorem holds for *any*
+fixed deterministic NaN payload and exception semantics, including flush modes,
+but requires the same ordered instruction sequence on both sides. It does not
+prove FMA equal to separate multiply/add, choose a compiler's FMA operand form,
+or equate distinct single-row/batch or CPU-family implementations. The source
+mapping and actual compiler output remain trusted/reviewed boundaries. The
+token manifest covers the source implementations and their local helper headers;
+a new matching source is also rejected until reviewed.
+
+The one-update shapes also apply to unpruned split kernels after reconstructing
+the same logical input block. This does not prove the split loader's pointer
+arithmetic or bounds; the existing guard-page tests check that integration.
+
+Negative controls detect moving updates into the wrong chain, assuming
+commutative NaN operand selection, and replacing FMA with separate mul/add.
+The latter uses an actual IEEE counterexample, not an uninterpreted function.
+
+## Proof boundary
+
+The trusted source-to-model translation is deliberately small and reviewable.
+`sources.json` pins the token stream of each modeled production source. Source
+changes fail closed until the translation and its obligations are reviewed;
+comments and formatting do not invalidate it. **Updating a fingerprint is not
+a proof of the changed source.** There is no automatic fingerprint-update
+option in the checker.
+
+Z3 checks the mathematical models, not the C++ compiler, generated instructions,
+CPU implementation, or the complete search engine. The runtime bit/exception
+comparisons in the parent directory remain necessary for those integration
+boundaries. In particular, SMT-LIB floating-point values merge NaN payloads and
+quiet/signaling NaNs; we use raw bitvectors for classification and only use the
+IEEE conversion model inside a proved finite normal domain.
+
+The checks do not claim that finite-cutoff pruning evaluates rejected rows or
+reproduces exception flags from skipped arithmetic. They do not cover malformed
+index files, memory safety, unmasked floating-point traps, or changing the FP
+environment asynchronously during a call.
+
+Semantics: [SMT-LIB bitvectors](https://smt-lib.org/theories-FixedSizeBitVectors.shtml)
+and [floating point](https://smt-lib.org/theories-FloatingPoint.shtml).
