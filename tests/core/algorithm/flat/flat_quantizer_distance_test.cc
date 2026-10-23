@@ -268,7 +268,7 @@ TEST(FlatQuantizerDistance, RejectedSplitOverwritesPoisonedScores) {
     entity.set_segment_size(1U << 20);
     ASSERT_EQ(0, entity.open(storage, meta));
     std::vector<float> row(dim), query(dim, .1f);
-    for (uint64_t id = 0; id < 67; ++id) {
+    for (uint64_t id = 0; id < 131; ++id) {
       for (size_t d = 0; d < dim; ++d)
         row[d] =
             float(int((id * 37 + d * 19 + id * d * 7) % 997) - 498) * .0031f;
@@ -294,7 +294,7 @@ TEST(FlatQuantizerDistance, RejectedSplitOverwritesPoisonedScores) {
           RejectingSplitQuantizer::calls() = 0;
           ASSERT_EQ(0, entity.search(query.data(), filter, &scanned, &heap,
                                      &counters, &scratch));
-          EXPECT_EQ(67U, scanned);
+          EXPECT_EQ(131U, scanned);
           if (reject && !filtered)
             EXPECT_GT(RejectingSplitQuantizer::calls(), 0U);
           heap.sort();

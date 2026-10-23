@@ -1576,6 +1576,49 @@ int FlatStreamerEntity::load_storage(IndexStorage::Pointer storage) {
     segments_.emplace_back(std::move(seg));
   }
 
+  const auto pool = storage->vec_buffer_pool();
+  if (read_only_ && use_key_info_map_ && meta_.header.block_count > 3 &&
+      pool && pool->cache_enabled() && !pool->writable() && pool->aio_enabled() &&
+      pool->file_size() <= ailego::MemoryLimitPool::get_instance().available() &&
+      linear_block_size() > ailego::kVectorPageSize &&
+      linear_block_size() >= sizeof(BlockHeader)) {
+    // Block headers are needed by the existing key-map walk. Load their pages
+    // together without changing traversal order or touching vector payloads.
+    auto preload_headers = [&]() {
+      std::array<ailego::block_id_t, 128> ids;
+      std::array<char *, 128> pages;
+      size_t pending = 0, remaining = meta_.header.block_count;
+      auto load = [&]() {
+        if (!pool->acquire_pages(ids.data(), pending, pages.data())) return false;
+        pool->release_pages(ids.data(), pending);
+        pending = 0;
+        return true;
+      };
+      for (size_t s = 1; s < segments_.size() && remaining; ++s) {
+        const auto &segment = segments_[s];
+        const size_t offset = segment->data_offset();
+        if (offset > pool->file_size() ||
+            segment->data_size() > pool->file_size() - offset)
+          return;
+        const size_t blocks =
+            std::min(remaining, segment->data_size() / linear_block_size());
+        for (size_t b = 0; b < blocks; ++b) {
+          const size_t end = offset + (b + 1) * linear_block_size();
+          const size_t last = (end - 1) / ailego::kVectorPageSize;
+          for (size_t page = (end - sizeof(BlockHeader)) / ailego::kVectorPageSize;
+               page <= last; ++page) {
+            if (pending && ids[pending - 1] == page) continue;
+            ids[pending++] = page;
+            if (pending == ids.size() && !load()) return;
+          }
+        }
+        remaining -= blocks;
+      }
+      if (pending > 3) (void)load();
+    };
+    preload_headers();
+  }
+
   for (size_t i = 0; i < linear_list_count(); i++) {
     IndexStorage::MemoryBlock head_block;
     this->get_head_block(head_block);
