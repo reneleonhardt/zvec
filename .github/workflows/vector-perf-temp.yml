@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 180
     env:
       BASELINE_SHA: 8d4996924bce78f8b072a353803c305101bcc807
-      BEFORE_SHA: 563c808de36e717be5e12a85b163129f698697ff
+      BEFORE_SHA: 00cffd5dcdebe3074a2e149bfec2b50843de5484
       DECODE_REFERENCE_SHA: 0659259a7fae0f5d0fec5337e82a37b975db7a6a
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
