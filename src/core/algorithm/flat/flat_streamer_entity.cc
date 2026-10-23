@@ -574,6 +574,28 @@ int FlatStreamerEntity::search_borrowed_block(
     resident = borrowed_pool_->try_acquire_resident_pages(
         page_ids.data(), page_ids.size(), pages.data());
   }
+#if defined(__linux__) && !defined(__ANDROID__)
+  if (!resident && read_only_ && !point_distance && linear_list_count() == 1 &&
+      borrowed_pool_->aio_enabled() && !borrowed_pool_->has_evicted() &&
+      linear_block_size() <= 64 * ailego::kVectorPageSize &&
+      borrowed_pool_->file_size() <=
+          ailego::MemoryLimitPool::get_instance().available()) {
+    // Bound read-ahead to four physical blocks; score in the original list order.
+    const size_t begin =
+        get_block_offset(block.block_index - block.block_index % 4);
+    const size_t length =
+        std::min(segment->data_size() - begin, 4 * linear_block_size());
+    const size_t position = segment->data_offset() + begin;
+    if (position <= borrowed_pool_->file_size() &&
+        length <= borrowed_pool_->file_size() - position) {
+      const size_t first = position / ailego::kVectorPageSize;
+      const size_t last = (position + length - 1) / ailego::kVectorPageSize;
+      borrowed_pool_->prefetch_pages(first, last - first + 1);
+      resident = borrowed_pool_->try_acquire_resident_pages(
+          page_ids.data(), page_ids.size(), pages.data());
+    }
+  }
+#endif
 #if defined(__APPLE__)
   if (!resident && read_only_ && !filter.is_valid() &&
       index_meta_.data_type() == IndexMeta::DT_FP32 &&

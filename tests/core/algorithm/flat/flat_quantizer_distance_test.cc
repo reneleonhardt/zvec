@@ -311,7 +311,10 @@ TEST(FlatQuantizerDistance, RejectedSplitOverwritesPoisonedScores) {
             expected[read_only][filtered] = actual;
           else
             EXPECT_EQ(expected[read_only][filtered], actual);
-          if (read_only) EXPECT_FALSE(scratch.vector_page_ids.empty());
+          if (read_only) {
+            EXPECT_EQ(expected[false][filtered], actual);
+            EXPECT_FALSE(scratch.vector_page_ids.empty());
+          }
           EXPECT_TRUE(scratch.vector_blocks.empty());
         }
       }
