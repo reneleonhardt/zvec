@@ -14,6 +14,7 @@ assembly for both x86-64 and ARM targets, without linking project libraries:
 
 ```sh
 nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_compiler_check.py
+nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_register_check.py
 nice -n 10 python3 .github/benchmarks/vector-perf/proofs/compiler_check.py \
   --cache .local/compiler-proof-cache --output .local/compiler-proof-report.json
 ```
@@ -57,6 +58,40 @@ run concurrently. Local cache/report files are not project deliverables.
 Real-compiler negative controls deliberately compile wrong-chain feedback and
 fast-math code, and mutate a parsed decoder rounding constant or remove guards.
 Cheap unit controls cover ISA leakage, half arithmetic and cache invalidation.
+
+## Register rewriting and FMA payload priority
+
+Every Clang translation unit is also compiled with `-verify-regalloc`,
+`-verify-coalescing`, `-verify-machineinstrs` and `-verify-misched`. These enable
+LLVM's structural checks of live intervals, register interference, machine
+instructions and scheduling. Available checks depend on the compiler build;
+these options are not an independent proof of the allocator. Optional GCC runs
+use `-fchecking=2` for its available internal checks.
+
+`register_check.py` independently compares LLVM's machine instructions immediately
+before and after `virtregrewriter`, the pass that replaces virtual registers
+with physical registers. It requires the same blocks, stable instruction slots,
+opcodes, ordered operands, immediate values, memory operands and FP-state uses.
+A virtual register must map consistently to one physical storage location,
+including its checked sub-register views. Surviving copies keep their original
+slots; an eliminated copy must resolve to identical register views. Stack
+addresses and spill/reload instructions are compared too. Missing, truncated
+or unrecognized instruction dumps fail closed.
+
+This checks FMA's **encoded operand roles**, including x86 132/213/231 forms and
+ARM FP16/FP32 FMLA/FMADD. It never equates multiplication operands or substitutes
+one FMA encoding for another. Identical instruction semantics with identical
+ordered raw-bit operands preserve any hardware NaN-payload priority and exception
+behavior at this pass boundary. This argument covers arbitrary payloads without
+a payload fixture set or an assumed common Intel/AMD/ARM priority table. It
+does not derive a vendor's priority rule or prove the hardware implements it.
+Scalar and SSE2 paths receive the same register checks even where no FMA exists.
+
+The verifier-enabled assembly must be byte-identical to the ordinary compile.
+Verification artifacts reuse a separate dependency-checked sidecar cache, so
+the existing AST/IR cache stays warm. Tests deliberately corrupt FMA encodings,
+operand order, register assignments/views, copy slots, FP-state uses and stack
+addresses; one control mutates an actual compiler dump.
 
 `check.py --emit path.smt2` saves the exact solver input for independent inspection or
 execution with `z3 path.smt2`. Each ordinary query asks for a counterexample;
@@ -159,10 +194,14 @@ aliasing, split-pointer reconstruction, every initializer or helper into a
 verified intermediate language. Source fingerprints remain required too.
 
 The IR/assembly checks are practical compiler regression checks, **not formal
-translation validation of every emitted instruction**. They do not prove
-register allocation, FMA NaN-payload operand priority, horizontal-reduction
-lowering or a CPU implementation correct. Native bit/exception comparisons in
-the parent directory remain necessary. In particular, SMT-LIB values merge NaN payloads and
+translation validation of every emitted instruction**. The register validator
+covers physical-register rewriting, not the preceding allocator's splitting,
+rematerialization, spilling or FMA commuting transformations. Those receive
+compiler structural checks, not independent semantic translation validation.
+Earlier instruction selection, later pseudo expansion, horizontal-reduction
+lowering and CPU behavior remain outside this independent check. GCC does not
+have the LLVM dump comparison. Native bit/exception comparisons in the parent
+directory remain necessary. In particular, SMT-LIB values merge NaN payloads and
 quiet/signaling NaNs; we use raw bitvectors for classification and only use the
 IEEE conversion model inside a proved finite normal domain.
 
@@ -173,3 +212,6 @@ environment asynchronously during a call.
 
 Semantics: [SMT-LIB bitvectors](https://smt-lib.org/theories-FixedSizeBitVectors.shtml)
 and [floating point](https://smt-lib.org/theories-FloatingPoint.shtml).
+Compiler boundaries: LLVM's [register rewriter](https://github.com/llvm/llvm-project/blob/main/llvm/lib/CodeGen/VirtRegMap.cpp),
+[machine verifier](https://github.com/llvm/llvm-project/blob/main/llvm/lib/CodeGen/MachineVerifier.cpp)
+and [FMA commuting rules](https://github.com/llvm/llvm-project/blob/main/llvm/lib/Target/X86/X86InstrFMA.td).

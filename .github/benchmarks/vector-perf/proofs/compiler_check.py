@@ -15,6 +15,7 @@ import shutil
 import subprocess
 
 import check
+import register_check
 
 
 FMA = re.compile(r"^(?:_mm(?:256|512)?_(?:mask3_)?fmadd_p[sh]|vfmaq_f(?:16|32))$")
@@ -317,6 +318,8 @@ def compile_one(root, cache, compiler, target, march, path, gnu=False):
     native_half = family in ("neon_fp16", "avx512_fp16") and (family == "avx512_fp16" or path.endswith("cosine.cc"))
     command = [*compiler, "-std=c++17", "-O3", "-DNDEBUG", "-fno-strict-aliasing", "-pthread",
                f"-march={march}"]
+    if gnu:
+        command.append("-fchecking=2")
     if not gnu:
         command.append(f"--target={target}")
     command += [f"-I{root / p}" for p in ("src/include", "src", "src/turbo", "src/turbo/distance")]
@@ -358,6 +361,23 @@ def compile_one(root, cache, compiler, target, march, path, gnu=False):
     if gnu:
         return {"path": path, "target": target, "march": march, "cache_hit": hit,
                 "compiler": "GCC assembly", "recurrences": []}
+    # Keep the existing AST/IR/assembly cache warm. Verification has its own
+    # compiler-keyed sidecar and must produce exactly the unaudited assembly.
+    flags = register_check.VERIFY + register_check.DUMP
+    verified = directory / hashlib.sha256(json.dumps(flags).encode()).hexdigest()[:16]
+    verified.mkdir(exist_ok=True)
+    verified_hit = cache_hit(verified, identity, ("kernel.s", "registers.txt"))
+    if not verified_hit:
+        with (verified / "registers.txt").open("w") as diagnostics:
+            subprocess.run([*command, *flags, "-S", str(root / path), "-o", str(verified / "kernel.s")],
+                           stderr=diagnostics, check=True, timeout=90)
+        saved = json.loads(stamp.read_text())
+        saved["artifacts"] = {name: hashlib.sha256((verified / name).read_bytes()).hexdigest()
+                              for name in ("kernel.s", "registers.txt")}
+        (verified / "stamp.json").write_text(json.dumps(saved))
+    if (directory / "kernel.s").read_bytes() != (verified / "kernel.s").read_bytes():
+        raise ValueError(f"verification changed emitted assembly: {path}")
+    registers = register_check.audit((verified / "registers.txt").read_text())
     ast = (directory / "ast.json").read_text()
     trace = source_trace(ast)
     decode = decoder_trace(ast) if "/conversion/" in path else None
@@ -367,6 +387,7 @@ def compile_one(root, cache, compiler, target, march, path, gnu=False):
     if "/distance/" in path and family != "scalar" and not path.endswith("cosine.cc") and not any(dtype != "float" for _, _, dtype, _ in trace):
         raise ValueError(f"{path}: vector accumulator edges were not extracted")
     return {"path": path, "target": target, "march": march, "cache_hit": hit,
+            "register_cache_hit": verified_hit, "register_rewrite": registers,
             "recurrences": trace, "decoder": decode,
             "source": check.fingerprint((root / path).read_text())}
 

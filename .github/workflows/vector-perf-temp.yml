@@ -57,10 +57,11 @@ jobs:
           nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_check.py
           nice -n 10 python3 .github/benchmarks/vector-perf/proofs/check.py
           nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_compiler_check.py
+          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_register_check.py
       - uses: actions/cache@v6
         with:
           path: .local/compiler-proof-cache
-          key: vector-arithmetic-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/turbo/**', 'src/include/**', 'src/ailego/utility/float_helper.cc', '.github/benchmarks/vector-perf/proofs/compiler_check.py') }}
+          key: vector-arithmetic-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/turbo/**', 'src/include/**', 'src/ailego/utility/float_helper.cc', '.github/benchmarks/vector-perf/proofs/compiler_check.py', '.github/benchmarks/vector-perf/proofs/register_check.py') }}
           restore-keys: vector-arithmetic-compiler-v1-${{ runner.os }}-${{ runner.arch }}-
       - name: Check source graphs and generated code for every CPU family
         run: |
