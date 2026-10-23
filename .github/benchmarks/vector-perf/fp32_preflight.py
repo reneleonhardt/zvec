@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check AVX2 FP32 source parity before building any project libraries."""
+"""Check restored distance kernels before building any project libraries."""
 
 import argparse
 import os
@@ -29,15 +29,24 @@ def main():
     flags = ["-std=c++17", "-O3", "-DNDEBUG", "-fPIC", "-fno-strict-aliasing", "-pthread"]
     includes = [f"-I{root / path}" for path in
                 ("src/include", "src", "src/turbo", "src/turbo/distance")]
-    kernels = [entry for entry in KERNELS if entry[0] == "avx2" and entry[1].startswith("fp32/")]
-    if len(kernels) != 2:
-        raise RuntimeError("expected exactly two AVX2 FP32 kernel families")
+    restored = {("avx2", "fp32/inner_product"),
+                ("avx2", "fp32/squared_euclidean"),
+                ("avx512", "fp16/squared_euclidean")}
+    kernels = [entry for entry in KERNELS if entry[:2] in restored]
+    if len(kernels) != len(restored):
+        raise RuntimeError("missing restored distance kernel family")
     print(f"Frozen source: {reference}; current sources: {root}", flush=True)
-    print("Kernel flags: " + shlex.join(flags + ["-march=core-avx2"]), flush=True)
+    print("Kernel flags: " + shlex.join(flags), flush=True)
     with tempfile.TemporaryDirectory(prefix="zvec-fp32-preflight-") as directory:
         temporary = Path(directory)
         objects, declarations, checks = [], [], []
-        for index, (isa, path, symbol, _) in enumerate(kernels):
+        helper = temporary / "float_helper.o"
+        subprocess.run(compiler + flags + includes + ["-march=x86-64",
+                       "-ffunction-sections", "-fdata-sections", "-c",
+                       str(root / "src/ailego/utility/float_helper.cc"),
+                       "-o", str(helper)], check=True)
+        objects.append(str(helper))
+        for index, (isa, path, symbol, half) in enumerate(kernels):
             filename = f"src/turbo/distance/{isa}/{path}.cc"
             source = subprocess.check_output(
                 ["git", "-C", str(root), "show", f"{reference}:{filename}"], text=True)
@@ -50,19 +59,20 @@ def main():
                 raise RuntimeError(f"unexpected frozen namespace: {filename}")
             frozen = temporary / f"reference{index}.cc"
             frozen.write_text(source.replace(namespace, f"namespace zvec::turbo::reference::{isa} {{", 1))
+            march = "core-avx2" if isa == "avx2" else "icelake-server"
             for label, translation_unit in (("reference", frozen), ("current", root / filename)):
                 obj = temporary / f"{label}{index}.o"
-                subprocess.run(compiler + flags + includes + ["-march=core-avx2", "-c",
+                subprocess.run(compiler + flags + includes + [f"-march={march}", "-c",
                                str(translation_unit), "-o", str(obj)], check=True)
                 objects.append(str(obj))
             for prefix in ("", "reference::"):
                 declarations.append(f"namespace zvec::turbo::{prefix}{isa} {{ void {symbol}(const void *const *, const void *, size_t, size_t, float *, const void *const *); }}")
-            checks.append(f'  if (avx2) {{ ++executed; failures += check<float>("{isa}/{path}", zvec::turbo::{isa}::{symbol}, zvec::turbo::reference::{isa}::{symbol}); }} else std::puts("SKIP {isa}/{path}: unavailable CPU features");')
+            checks.append(f'  if ({isa}) {{ ++executed; failures += check<{"uint16_t" if half else "float"}>("{isa}/{path}", zvec::turbo::{isa}::{symbol}, zvec::turbo::reference::{isa}::{symbol}); }} else std::puts("SKIP {isa}/{path}: unavailable CPU features");')
         driver = temporary / "driver.cc"
         driver.write_text(DRIVER.replace("@DECLARATIONS@", "\n".join(declarations)).replace("@CHECKS@", "\n".join(checks)))
         executable = temporary / "fp32-preflight"
         subprocess.run(compiler + flags + ["-march=x86-64", str(driver), *objects,
-                       "-o", str(executable)], check=True)
+                       "-Wl,--gc-sections", "-o", str(executable)], check=True)
         subprocess.run([str(executable)], check=True)
 
 

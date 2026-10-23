@@ -108,16 +108,6 @@ cpu_flags = Path('/proc/cpuinfo').read_text().lower()
 arches = ('auto', 'avx2') if platform.machine() == 'x86_64' and 'avx512f' in cpu_flags else ('auto',)
 full_suite = metadata['suite'] == 'all'
 storages = ('bufferpool',) if metadata['suite'] == 'storage' else ('mmap', 'bufferpool')
-if metadata['suite'] == 'cold-cosine':
-    for arch in arches:
-        prepare(arch, arch, 'fixture', ('flat', 'cos32', 'ip32'))
-        for name, reference in [('main', main), ('before', before)]:
-            for count in (1, 64):
-                for replica in range(3):
-                    compare(arch, name, reference, 'cold', 'cos32', 'bufferpool',
-                            count=count, replica=replica)
-                compare(arch, name, reference, 'coldalloc', 'cos32', 'bufferpool', count=count)
-    sys.exit(0)
 for arch in arches:
     prepare(arch, arch, 'fixture', kinds)
     for name, reference in [('main', main), ('before', before)]:
@@ -136,7 +126,7 @@ for arch in arches:
                         if not full_suite and (mode.startswith('fetch') != (kind == 'physical')):
                             continue
                         compare(arch, name, reference, mode, kind, storage, count=batch)
-                        if metadata['suite'] == 'storage' and mode == 'cold' and batch == 1 and kind in ('flat', 'cos32', 'ip32'):
+                        if metadata['suite'] == 'storage' and mode == 'cold' and kind in ('flat', 'cos32', 'ip32'):
                             compare(arch, name, reference, mode, kind, storage, count=batch, replica=1)
         if full_suite:
             for kind in ('flat', 'ivf'):
@@ -153,6 +143,16 @@ for arch in arches:
                 for mode in ('fetchcold', 'fetchcoldalloc'):
                     compare(arch, 'candidate-avx2', candidate, mode, 'physical', storage,
                             count=count, reference_arch='avx2')
+    if metadata['suite'] == 'storage':
+        # Restoring ordinary AVX-512 FP16 L2 also affects the mmap fallback.
+        for name, reference in [('main', main), ('before', before)]:
+            for kind in ('fp16', 'raw16'):
+                for count in (1, 4):
+                    for mode in ('warm', 'alloc'):
+                        compare(arch, name, reference, mode, kind, 'mmap', count=count)
+                for count in (1, 64):
+                    for mode in ('cold', 'coldalloc'):
+                        compare(arch, name, reference, mode, kind, 'mmap', count=count)
     data_name = f'{arch}-d256'
     prepare(arch, data_name, 'fixture256', ('raw16',))
     for name, reference in [('main', main), ('before', before)]:

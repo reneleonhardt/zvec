@@ -19,8 +19,8 @@ jobs:
       CCACHE_BASEDIR: ${{ github.workspace }}
       CCACHE_DIR: ${{ github.workspace }}/.ccache-vector-perf
       CCACHE_MAXSIZE: 3G
-      VECTOR_PERF_SUITE: cold-cosine
-      VECTOR_PERF_COLD_TRIALS: 7
+      VECTOR_PERF_SUITE: storage
+      VECTOR_PERF_COLD_TRIALS: 3
     steps:
       - uses: actions/cache/restore@v6
         with:
@@ -54,7 +54,7 @@ jobs:
         with:
           submodules: recursive
           path: candidate
-      - name: Check FP32 arithmetic before building project libraries
+      - name: Check restored arithmetic before building project libraries
         run: |
           set -euo pipefail
           git -C candidate fetch --depth=1 origin "$BASELINE_SHA"
