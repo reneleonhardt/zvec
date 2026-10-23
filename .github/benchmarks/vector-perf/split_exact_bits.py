@@ -27,20 +27,48 @@ KERNELS = [
 
 ADAPTER = r"""
 #include <algorithm>
+#include <cstdlib>
+#include <sys/mman.h>
+#include <unistd.h>
 #include "quantizer/split_distance_quantizer.h"
+class GuardedSpans {
+ public:
+  GuardedSpans() : page_(static_cast<size_t>(sysconf(_SC_PAGESIZE))) {
+    data_ = static_cast<char *>(mmap(nullptr, 131 * page_, PROT_NONE,
+                                   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+    if (data_ == MAP_FAILED) std::abort();
+    for (size_t slot = 0; slot < 65; ++slot)
+      if (mprotect(data_ + (2 * slot + 1) * page_, page_, PROT_READ | PROT_WRITE))
+        std::abort();
+  }
+  ~GuardedSpans() { munmap(data_, 131 * page_); }
+  void *copy(size_t slot, const void *source, size_t bytes) {
+    if (slot >= 65 || bytes > page_) std::abort();
+    if (!bytes) return nullptr;
+    void *destination = data_ + (2 * slot + 2) * page_ - bytes;
+    std::memcpy(destination, source, bytes);
+    return destination;
+  }
+ private:
+  size_t page_;
+  char *data_;
+};
 static size_t boundary_case = 0, rejected_calls = 0;
 template <typename T, auto Split, Batch Fallback>
 void split_batch(const void *const *vectors, const void *query, size_t count,
                  size_t dim, float *distances, const void *const *) {
   std::array<zvec::turbo::SplitVector, 32> spans;
+  static GuardedSpans arena;
   for (size_t row = 0; row < count; ++row) {
     const size_t cut = boundary_case == 0 ? 0 : boundary_case == 1 ? dim :
                        boundary_case == 2 ? (row * 7 + 1) % (dim + 1) : dim - 1;
-    spans[row] = {cut ? vectors[row] : nullptr,
-                  cut == dim ? nullptr : static_cast<const T *>(vectors[row]) + cut,
+    spans[row] = {arena.copy(2 * row, vectors[row], cut * sizeof(T)),
+                  arena.copy(2 * row + 1, static_cast<const T *>(vectors[row]) + cut,
+                             (dim - cut) * sizeof(T)),
                   cut * sizeof(T)};
   }
-  if (!Split(spans.data(), count, query, dim, distances, __builtin_inff())) {
+  const void *guarded_query = arena.copy(64, query, dim * sizeof(T));
+  if (!Split(spans.data(), count, guarded_query, dim, distances, __builtin_inff())) {
     ++rejected_calls;
     Fallback(vectors, query, count, dim, distances, nullptr);
   }
