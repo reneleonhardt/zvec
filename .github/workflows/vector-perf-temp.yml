@@ -11,7 +11,7 @@ concurrency:
 jobs:
   arithmetic-proof:
     runs-on: ubuntu-26.04
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       benchmark: ${{ steps.scope.outputs.benchmark }}
     steps:
@@ -21,10 +21,21 @@ jobs:
       - name: Check arithmetic models without building project libraries
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends z3
+          sudo apt-get install -y --no-install-recommends z3 clang g++-aarch64-linux-gnu
           z3 --version
           nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_check.py
           nice -n 10 python3 .github/benchmarks/vector-perf/proofs/check.py
+          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_compiler_check.py
+      - uses: actions/cache@v6
+        with:
+          path: .local/compiler-proof-cache
+          key: vector-arithmetic-compiler-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('src/turbo/**', 'src/include/**', 'src/ailego/utility/float_helper.cc', '.github/benchmarks/vector-perf/proofs/compiler_check.py') }}
+          restore-keys: vector-arithmetic-compiler-v1-${{ runner.os }}-${{ runner.arch }}-
+      - name: Check source graphs and generated code for every CPU family
+        run: |
+          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/compiler_check.py \
+            --cache .local/compiler-proof-cache --output .local/compiler-proof-report.json \
+            --gnu-cxx g++ --gnu-arm-cxx aarch64-linux-gnu-g++
       - name: Avoid rerunning expensive benchmarks for proof-only changes
         id: scope
         env:
@@ -234,7 +245,10 @@ jobs:
           fi
           nice -n 10 cmake -S benchmark-harness -B build-candidate -G Ninja \
             -DZVEC_SOURCE_DIR="$GITHUB_WORKSPACE/candidate" -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          nice -n 10 python3 candidate/.github/benchmarks/vector-perf/proofs/compiler_check.py \
+            --build-options-only --compile-commands build-candidate/compile_commands.json
           nice -n 10 cmake --build build-candidate --target vector_system_search vector_pool_workloads vector_alloc_probe turbo_avx2_distance_test turbo_fp16_quantizer_test flat_quantizer_distance_test vector_page_table_test --parallel 4
           nice -n 10 ctest --test-dir build-candidate -R '^(flat_quantizer_distance_test|vector_page_table_test|vector_perf_harness_smoke)$' --output-on-failure --no-tests=error
           mkdir -p bench-candidate/lib
