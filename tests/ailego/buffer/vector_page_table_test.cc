@@ -528,6 +528,29 @@ TEST_F(BufferPoolTest, PinnedEvictionBecomesReclaimableAfterRelease) {
   EXPECT_FALSE(pool.page_table_.is_loaded(page_id));
 }
 
+TEST_F(BufferPoolTest, PinsStayIndependentAcrossEntryGroupsAndSegments) {
+  constexpr size_t segment = 16 * 1024;
+  init_table_pool(/*capacity_pages=*/64, /*entry_num=*/segment + 16);
+  VectorPageTable table;
+  ASSERT_TRUE(table.init(segment + 16));
+  std::array<char *, 32> buffers{};
+  auto id = [](size_t i) { return i < 16 ? i : segment + i - 16; };
+  for (size_t i = 0; i < buffers.size(); ++i) {
+    ASSERT_TRUE(MemoryLimitPool::get_instance().try_acquire_buffer(
+        kVectorPageSize, buffers[i]));
+    buffers[i][0] = static_cast<char>(i);
+    ASSERT_EQ(buffers[i], table.set_block_acquired(id(i), buffers[i],
+                                                  id(i) * kVectorPageSize));
+  }
+  for (size_t i = buffers.size(); i-- > 0;) {
+    ASSERT_EQ(buffers[i], table.acquire_block(id(i)));
+    EXPECT_EQ(static_cast<char>(i), buffers[i][0]);
+    table.release_block(id(i));
+    table.release_block(id(i));
+    EXPECT_TRUE(table.force_evict_block(id(i)));
+  }
+}
+
 // A stale eviction item must not become valid again when a later page table
 // reuses the same owner address. Version zero represents an entry issued by a
 // different/legacy owner generation; the current resident page must survive.
