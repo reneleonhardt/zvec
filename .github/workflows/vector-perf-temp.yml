@@ -9,7 +9,43 @@ concurrency:
   group: vector-perf-${{ github.ref }}
   cancel-in-progress: true
 jobs:
+  arithmetic-proof:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    outputs:
+      benchmark: ${{ steps.scope.outputs.benchmark }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 2
+      - name: Check arithmetic models without building project libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends z3
+          z3 --version
+          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_check.py
+          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/check.py
+      - name: Avoid rerunning expensive benchmarks for proof-only changes
+        id: scope
+        env:
+          BEFORE_PUSH: ${{ github.event.before }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$EVENT" == workflow_dispatch ]]; then
+            echo 'benchmark=true' >> "$GITHUB_OUTPUT"
+          elif ! git cat-file -e "$BEFORE_PUSH^{commit}" 2>/dev/null &&
+               ! git fetch --no-tags --depth=1 origin "$BEFORE_PUSH"; then
+            echo 'benchmark=true' >> "$GITHUB_OUTPUT"
+          elif git diff --quiet "$BEFORE_PUSH" HEAD -- src tests cmake CMakeLists.txt \
+               .github/benchmarks/vector-perf ':!.github/benchmarks/vector-perf/proofs'; then
+            echo 'benchmark=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'benchmark=true' >> "$GITHUB_OUTPUT"
+          fi
   benchmark:
+    needs: arithmetic-proof
+    if: needs.arithmetic-proof.outputs.benchmark == 'true'
     runs-on: ubuntu-26.04
     timeout-minutes: 180
     env:
