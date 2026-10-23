@@ -18,9 +18,10 @@ nice -n 10 python3 .github/benchmarks/vector-perf/proofs/compiler_check.py \
   --cache .local/compiler-proof-cache --output .local/compiler-proof-report.json
 ```
 
-Linux needs ARM cross C++ headers (`g++-aarch64-linux-gnu` on Ubuntu). macOS uses
+Linux needs ARM cross C++ headers (`libstdc++-15-dev-arm64-cross` on Ubuntu). macOS uses
 Xcode's SDK for both targets. Linux can additionally check GCC assembly with
-`--gnu-cxx g++ --gnu-arm-cxx aarch64-linux-gnu-g++`; CI requires both. No CPU
+`--gnu-cxx g++ --gnu-arm-cxx aarch64-linux-gnu-g++` when both GCC toolchains are
+installed. CI uses the smaller headers-only Clang setup. No CPU
 feature is skipped based on the machine executing the compiler: all eight
 source families, including native AVX-512 FP16, are cross-compiled. Compilation
 does **not** imply execution on those CPUs.

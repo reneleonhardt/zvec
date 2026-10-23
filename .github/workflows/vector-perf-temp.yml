@@ -24,17 +24,17 @@ jobs:
           path: .apt-vector-proof/*.deb
           key: vector-proof-apt-2604-v1-${{ github.run_id }}
           restore-keys: vector-proof-apt-2604-v1-
-      - name: Check arithmetic models without building project libraries
+      - name: Install missing compiler proof tools
         run: |
           set -euo pipefail
           missing=()
           command -v z3 >/dev/null || missing+=(z3)
           command -v clang++ >/dev/null || missing+=(clang)
           command -v g++ >/dev/null || missing+=(g++)
-          command -v aarch64-linux-gnu-g++ >/dev/null || missing+=(g++-aarch64-linux-gnu)
+          [[ -d /usr/aarch64-linux-gnu/include/c++/15 ]] || missing+=(libstdc++-15-dev-arm64-cross)
           if ((${#missing[@]})); then
             mkdir -p .apt-vector-proof
-            for sources in /etc/apt/sources.list /etc/apt/sources.list.d/ubuntu.sources; do
+            for sources in /etc/apt/apt-mirrors.txt /etc/apt/sources.list /etc/apt/sources.list.d/*.sources /etc/apt/sources.list.d/*.list; do
               if [[ -f "$sources" ]]; then
                 sudo sed -i 's|http://azure.archive.ubuntu.com/ubuntu|https://archive.ubuntu.com/ubuntu|g' "$sources"
               fi
@@ -47,14 +47,16 @@ jobs:
               install -y --no-install-recommends "${missing[@]}"
           fi
           z3 --version
-          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_check.py
-          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/check.py
-          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_compiler_check.py
       - uses: actions/cache/save@v6
         if: always() && steps.proof-tools.outputs.cache-hit != 'true'
         with:
           path: .apt-vector-proof/*.deb
           key: vector-proof-apt-2604-v1-${{ github.run_id }}
+      - name: Check arithmetic models without building project libraries
+        run: |
+          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_check.py
+          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/check.py
+          nice -n 10 python3 .github/benchmarks/vector-perf/proofs/test_compiler_check.py
       - uses: actions/cache@v6
         with:
           path: .local/compiler-proof-cache
@@ -63,8 +65,7 @@ jobs:
       - name: Check source graphs and generated code for every CPU family
         run: |
           nice -n 10 python3 .github/benchmarks/vector-perf/proofs/compiler_check.py \
-            --cache .local/compiler-proof-cache --output .local/compiler-proof-report.json \
-            --gnu-cxx g++ --gnu-arm-cxx aarch64-linux-gnu-g++
+            --cache .local/compiler-proof-cache --output .local/compiler-proof-report.json
       - name: Avoid rerunning expensive benchmarks for proof-only changes
         id: scope
         env:
