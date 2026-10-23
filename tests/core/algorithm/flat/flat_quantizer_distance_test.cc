@@ -29,6 +29,8 @@ class DistinctPointQuantizer : public turbo::Fp32Quantizer {
  public:
   float calc_distance_dp_query(const void *dp, const void *) const override {
     ++point_calls;
+    EXPECT_EQ(*static_cast<const float *>(dp),
+              static_cast<const float *>(dp)[dim() - 1]);
     return *static_cast<const float *>(dp);
   }
   void calc_distance_dp_query_batch(const void *const *, int count,
@@ -169,7 +171,7 @@ TEST(FlatQuantizerDistance, FilteredStreamerKeepsPointDispatch) {
       ASSERT_EQ(0, entity.open(storage, meta));
       std::vector<float> row(dim);
       for (uint64_t id = 0; id < 64; ++id) {
-        row[0] = float(id) + .25f;
+        std::fill(row.begin(), row.end(), float(id) + .25f);
         ASSERT_EQ(0, entity.add(id, row.data(), meta.element_size()));
       }
       if (deleted) {
@@ -217,6 +219,12 @@ TEST(FlatQuantizerDistance, FilteredStreamerKeepsPointDispatch) {
           }
           if (read_only && std::string(backend) == "BufferStorage") {
             EXPECT_FALSE(scratch.vector_page_ids.empty());
+            if (repeat == 1) {
+              EXPECT_TRUE(scratch.vector_ptrs.empty());
+              EXPECT_LE(scratch.vector_buffer.size() *
+                            sizeof(scratch.vector_buffer[0]),
+                        ailego_align(meta.element_size(), AILEGO_CACHE_LINE_SIZE));
+            }
           }
           EXPECT_TRUE(scratch.vector_blocks.empty());
         }

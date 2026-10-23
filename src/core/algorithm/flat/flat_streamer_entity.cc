@@ -584,6 +584,35 @@ int FlatStreamerEntity::search_borrowed_block(
   // Batch reductions can round differently even for finite inputs.
   const bool point_distance = header->vector_count == 1 || filter.is_valid() ||
                               deletion_map->is_dirty();
+  if (resident && point_distance) {
+    auto &buffer = scratch->vector_buffer;
+    const size_t lines = ailego_align(stride, AILEGO_CACHE_LINE_SIZE) /
+                         sizeof(buffer[0]);
+    if (buffer.size() < lines) buffer.resize(lines);
+    auto *spill = reinterpret_cast<char *>(buffer.data());
+    for (size_t k = 0; k < header->vector_count; ++k) {
+      if (!keeps.test(k)) continue;
+      const size_t position = absolute + k * stride;
+      const size_t page = position / ailego::kVectorPageSize - first_page;
+      const size_t in_page = position % ailego::kVectorPageSize;
+      const size_t available = ailego::kVectorPageSize - in_page;
+      const char *row = pages[page] + in_page;
+      if (stride > available) {
+        std::memcpy(spill, row, available);
+        std::memcpy(spill + available, pages[page + 1], stride - available);
+        row = spill;
+      }
+      // Point kernels and insertion order must match the owned filtered path.
+      dist_t distance;
+      if (quantizer_)
+        distance = quantizer_->calc_distance_dp_query(row, query);
+      else
+        row_major_distance(query, row, 1, &distance);
+      heap->emplace(keys[k], distance);
+    }
+    *context_stats->mutable_dist_calced_count() += candidate_count;
+    return 0;
+  }
   if (resident && split_distance_ && !point_distance) {
     auto &vectors = scratch->split_vectors;
     vectors.clear();
