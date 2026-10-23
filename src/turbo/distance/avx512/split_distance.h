@@ -18,6 +18,10 @@
 
 namespace zvec::turbo::avx512 {
 
+bool inner_product_fp32_split_batch(const SplitVector *, size_t,
+                                    const void *, size_t, float *, float);
+bool cosine_fp32_split_batch(const SplitVector *, size_t, const void *, size_t,
+                             float *, float);
 bool squared_euclidean_fp32_split_batch(const SplitVector *, size_t,
                                         const void *, size_t, float *, float);
 bool squared_euclidean_fp16_split_batch(const SplitVector *, size_t,

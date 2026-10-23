@@ -263,7 +263,8 @@ TEST(TurboAvx512Distance, Fp32SplitAndWiderBatchPreserveBits) {
     if (count > 25 && count != 32) continue;
     CheckSplits<float>(
         DataType::kFp32, QuantizeType::kFp32,
-        {avx512::squared_euclidean_fp32_split_batch, nullptr, nullptr},
+        {avx512::squared_euclidean_fp32_split_batch,
+         avx512::inner_product_fp32_split_batch, avx512::cosine_fp32_split_batch},
         CpuArchType::kAVX512, count);
   }
 }

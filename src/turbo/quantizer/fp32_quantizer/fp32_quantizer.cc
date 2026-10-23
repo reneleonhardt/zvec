@@ -25,6 +25,8 @@
 #include "avx2/fp32/inner_product.h"
 #include "avx2/fp32/squared_euclidean.h"
 #include "avx2/split_distance.h"
+#include "avx512/fp32/cosine.h"
+#include "avx512/fp32/inner_product.h"
 #include "avx512/fp32/squared_euclidean.h"
 #include "avx512/split_distance.h"
 #include "core/quantizer/record_quantizer.h"
@@ -176,11 +178,17 @@ SplitDistanceQuantizer::Distance Fp32Quantizer::split_distance() const {
   const auto &features = ailego::internal::CpuFeatures::static_flags_;
   const bool avx512_split = features.AVX512DQ && features.AVX512BW &&
                             features.AVX512VL && features.F16C;
-  if (avx512_split && point && batch &&
-      original_dim_ % 16 == 0 &&
-      *point == avx512::squared_euclidean_fp32_distance_avx512 &&
-      *batch == avx512::squared_euclidean_fp32_batch_distance_avx512)
-    return avx512::squared_euclidean_fp32_split_batch;
+  if (avx512_split && point && batch && original_dim_ % 16 == 0) {
+    if (*point == avx512::squared_euclidean_fp32_distance_avx512 &&
+        *batch == avx512::squared_euclidean_fp32_batch_distance_avx512)
+      return avx512::squared_euclidean_fp32_split_batch;
+    if (*point == avx512::inner_product_fp32_distance_avx512 &&
+        *batch == avx512::inner_product_fp32_batch_distance_avx512)
+      return avx512::inner_product_fp32_split_batch;
+    if (*point == avx512::cosine_fp32_distance_avx512 &&
+        *batch == avx512::cosine_fp32_batch_distance_avx512)
+      return avx512::cosine_fp32_split_batch;
+  }
   if (point && batch && original_dim_ % 8 == 0) {
     if (*point == avx2::squared_euclidean_fp32_distance_avx2 &&
         *batch == avx2::squared_euclidean_fp32_batch_distance_avx2)

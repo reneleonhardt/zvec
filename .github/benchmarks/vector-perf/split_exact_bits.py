@@ -15,9 +15,11 @@ KERNELS = [
     for dtype in ("fp32", "fp16")
     for metric in ("inner_product", "cosine", "squared_euclidean")
 ] + [
-    ("avx512", f"{dtype}/squared_euclidean", f"squared_euclidean_{dtype}_batch_distance_avx512",
-     f"squared_euclidean_{dtype}_split_batch", dtype == "fp16", 16)
+    ("avx512", f"{dtype}/{metric}", f"{metric}_{dtype}_batch_distance_avx512",
+     f"{metric}_{dtype}_split_batch", dtype == "fp16", 16)
     for dtype in ("fp32", "fp16")
+    for metric in ("squared_euclidean", "inner_product", "cosine")
+    if dtype == "fp32" or metric == "squared_euclidean"
 ] + [
     ("avx512_vnni", "fp16/squared_euclidean", "squared_euclidean_fp16_batch_distance",
      "squared_euclidean_raw_fp16_split_batch", True, 32),

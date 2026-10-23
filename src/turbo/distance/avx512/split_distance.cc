@@ -64,7 +64,7 @@ float reduce(__m512 first, __m512 second) {
   }
 }
 
-template <typename T, bool Raw = false>
+template <typename T, bool Raw = false, bool Dot = false>
 bool split_batch(const SplitVector *vectors, size_t count, const void *query,
                  size_t dim, float *distances, float cutoff) {
   if (dim % (Raw ? 32 : 16)) return false;
@@ -86,11 +86,16 @@ bool split_batch(const SplitVector *vectors, size_t count, const void *query,
     for (size_t d = 0; d < dim; d += 16) {
       const __m512 rhs = load(q + d);
       for (size_t row = 0; row < rows; ++row) {
-        const __m512 diff = _mm512_sub_ps(rhs, load<T>(vectors[i + row], d));
+        const __m512 value = load<T>(vectors[i + row], d);
         __m512 &sum = Raw && (d % 32) ? second[row] : first[row];
-        sum = _mm512_fmadd_ps(diff, diff, sum);
+        if constexpr (Dot) {
+          sum = _mm512_fmadd_ps(rhs, value, sum);
+        } else {
+          const __m512 diff = _mm512_sub_ps(rhs, value);
+          sum = _mm512_fmadd_ps(diff, diff, sum);
+        }
       }
-      if (d == 48 && dim > 64 && rows == 4 && std::isfinite(cutoff)) {
+      if (!Dot && d == 48 && dim > 64 && rows == 4 && std::isfinite(cutoff)) {
         rejected = true;
         for (size_t row = 0; row < rows; ++row)
           rejected &= reduce<Raw>(first[row], second[row]) >= cutoff;
@@ -100,6 +105,7 @@ bool split_batch(const SplitVector *vectors, size_t count, const void *query,
     for (size_t row = 0; row < rows; ++row) {
       distances[i + row] = rejected ? std::numeric_limits<float>::infinity()
                                     : reduce<Raw>(first[row], second[row]);
+      if constexpr (Dot) distances[i + row] = -distances[i + row];
       uint32_t bits;
       std::memcpy(&bits, &distances[i + row], sizeof(bits));
       if ((bits & 0x7fffffffU) > 0x7f800000U) return false;
@@ -114,6 +120,33 @@ bool split_batch(const SplitVector *vectors, size_t count, const void *query,
 #endif
 
 namespace zvec::turbo::avx512 {
+
+bool inner_product_fp32_split_batch(const SplitVector *vectors, size_t count,
+                                    const void *query, size_t dim,
+                                    float *distances, float cutoff) {
+#if defined(__AVX512F__) && defined(__AVX512DQ__) && defined(__F16C__)
+  return split_batch<float, false, true>(vectors, count, query, dim, distances,
+                                         cutoff);
+#else
+  (void)vectors;
+  (void)count;
+  (void)query;
+  (void)dim;
+  (void)distances;
+  (void)cutoff;
+  return false;
+#endif
+}
+
+bool cosine_fp32_split_batch(const SplitVector *vectors, size_t count,
+                             const void *query, size_t dim, float *distances,
+                             float cutoff) {
+  if (!inner_product_fp32_split_batch(vectors, count, query, dim, distances,
+                                      cutoff))
+    return false;
+  for (size_t i = 0; i < count; ++i) distances[i] += 1.0f;
+  return true;
+}
 
 bool squared_euclidean_fp32_split_batch(const SplitVector *vectors,
                                         size_t count, const void *query,
