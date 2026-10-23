@@ -1918,6 +1918,9 @@ TEST_F(BufferPoolTest, DenseClaimedReadsKeepTailAndIndependentPins) {
   std::array<block_id_t, count> ids;
   std::array<char *, count> pages{};
   for (size_t i = 0; i < count; ++i) ids[i] = i;
+  ASSERT_TRUE(handle.acquire_pages(ids.data(), count - 1, pages.data()));
+  EXPECT_EQ(0U, pool.stats().aio_pages_submitted);
+  handle.release_pages(ids.data(), count - 1);
   ASSERT_TRUE(handle.acquire_pages(ids.data(), count, pages.data()));
   for (size_t i = 0; i < count; ++i) {
     for (size_t j = 0; j < kVectorPageSize; ++j)
